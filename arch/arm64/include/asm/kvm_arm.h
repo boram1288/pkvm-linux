@@ -347,6 +347,7 @@
 	(((par) & GENMASK_ULL(52 - 1, 12)) >> 8)
 
 #define FAR_MASK GENMASK_ULL(11, 0)
+#define FAR_TO_FIPA_OFFSET(far) ((far) & FAR_MASK)
 
 #define ECN(x) { ESR_ELx_EC_##x, #x }
 
