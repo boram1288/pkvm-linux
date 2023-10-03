@@ -1728,4 +1728,9 @@ static __always_inline enum fgt_group_id __fgt_reg_to_group_id(enum vcpu_sysreg 
 		p;							\
 	})
 
+/* Allocator interface IDs. */
+#define HYP_ALLOC_MGT_HEAP_ID          0
+
+unsigned long __pkvm_reclaim_hyp_alloc_mgt(unsigned long nr_pages);
+
 #endif /* __ARM64_KVM_HOST_H__ */
