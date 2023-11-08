@@ -116,6 +116,7 @@ static inline unsigned long pvm_supported_vcpu_features(void)
 enum pkvm_moveable_reg_type {
 	PKVM_MREG_MEMORY,
 	PKVM_MREG_PROTECTED_RANGE,
+	PKVM_MREG_ASSIGN_MMIO,
 };
 
 struct pkvm_moveable_reg {
