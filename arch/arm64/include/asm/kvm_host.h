@@ -1876,6 +1876,7 @@ static inline long kvm_get_cap_for_kvm_ioctl(unsigned int ioctl, long *ext)
 	return -EINVAL;
 }
 
+#define HYP_ALLOC_MGT_IOMMU_ID         1
 #ifndef __KVM_NVHE_HYPERVISOR__
 struct kvm_iommu_driver {
 	int (*init_driver)(void);
