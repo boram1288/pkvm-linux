@@ -26,8 +26,38 @@ int pkvm_create_hyp_vcpu(struct kvm_vcpu *vcpu);
 void pkvm_host_reclaim_page(struct kvm *host_kvm, phys_addr_t ipa);
 int pkvm_enable_smc_forwarding(struct file *kvm_file);
 /*
- * This functions as an allow-list of protected VM capabilities.
- * Features not explicitly allowed by this function are denied.
+ * Check whether the specific capability is allowed in pKVM.
+ *
+ * Certain features are allowed only for non-protected VMs in pKVM, which is why
+ * this takes the VM (kvm) as a parameter.
+ */
+static inline bool kvm_pkvm_ext_allowed(struct kvm *kvm, long ext)
+{
+	switch (ext) {
+	case KVM_CAP_IRQCHIP:
+	case KVM_CAP_ONE_REG:
+	case KVM_CAP_ARM_PSCI:
+	case KVM_CAP_ARM_PSCI_0_2:
+	case KVM_CAP_NR_VCPUS:
+	case KVM_CAP_MAX_VCPUS:
+	case KVM_CAP_MAX_VCPU_ID:
+	case KVM_CAP_MSI_DEVID:
+	case KVM_CAP_ARM_VM_IPA_SIZE:
+	case KVM_CAP_ARM_PMU_V3:
+	case KVM_CAP_ARM_SVE:
+	case KVM_CAP_ARM_PTRAUTH_ADDRESS:
+	case KVM_CAP_ARM_PTRAUTH_GENERIC:
+	case KVM_CAP_ARM_PROTECTED_VM:
+		return true;
+	default:
+		return !kvm || !kvm_vm_is_protected(kvm);
+	}
+}
+
+/*
+ * Protected-VM view of the above: anything not explicitly allowed is denied.
+ * Equivalent to kvm_pkvm_ext_allowed() called with a protected VM, which is not
+ * available at the call sites below. Keep the case list in sync.
  */
 static inline bool kvm_pvm_ext_allowed(long ext)
 {
