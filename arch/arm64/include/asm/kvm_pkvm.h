@@ -58,6 +58,26 @@ static inline bool kvm_pkvm_ext_allowed(struct kvm *kvm, long ext)
 	}
 }
 
+static inline bool __ioctl_is_smccc_filter(unsigned int ioctl, void __user *argp)
+{
+	struct kvm_device_attr attr;
+
+	switch (ioctl) {
+	case KVM_SET_DEVICE_ATTR:
+	case KVM_GET_DEVICE_ATTR:
+	case KVM_HAS_DEVICE_ATTR:
+		break;
+	default:
+		return false;
+	}
+
+	if (copy_from_user(&attr, argp, sizeof(attr)))
+		return false;
+
+	return attr.group == KVM_ARM_VM_SMCCC_CTRL &&
+	       attr.attr == KVM_ARM_VM_SMCCC_FILTER;
+}
+
 /*
  * Protected-VM view of the above: anything not explicitly allowed is denied.
  * Equivalent to kvm_pkvm_ext_allowed() called with a protected VM, which is not
@@ -135,7 +155,7 @@ extern unsigned int kvm_nvhe_sym(pkvm_moveable_regs_nr);
  * Certain features are allowed only for non-protected VMs in pKVM, which is why
  * this takes the VM (kvm) as a parameter.
  */
-static inline bool kvm_pkvm_ioctl_allowed(struct kvm *kvm, unsigned int ioctl)
+static inline bool kvm_pkvm_ioctl_allowed(struct kvm *kvm, unsigned int ioctl, void __user *argp)
 {
 	long ext;
 	int r;
@@ -145,7 +165,10 @@ static inline bool kvm_pkvm_ioctl_allowed(struct kvm *kvm, unsigned int ioctl)
 	if (WARN_ON_ONCE(r < 0))
 		return false;
 
-	return kvm_pkvm_ext_allowed(kvm, ext);
+	if (kvm_pkvm_ext_allowed(kvm, ext))
+		return true;
+
+	return __ioctl_is_smccc_filter(ioctl, argp);
 }
 
 extern phys_addr_t kvm_nvhe_sym(host_s2_cma_base);
