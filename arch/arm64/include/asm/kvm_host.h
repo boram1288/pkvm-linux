@@ -1886,7 +1886,22 @@ static inline long kvm_get_cap_for_kvm_ioctl(unsigned int ioctl, long *ext)
 	return -EINVAL;
 }
 
+<<<<<<< HEAD
 #define HYP_ALLOC_MGT_IOMMU_ID         1
+=======
+/* Allocator interface IDs. */
+enum hyp_alloc_mgt_id {
+	__HYP_ALLOC_MGT_HEAP_ID_START__ = 0,
+	HYP_ALLOC_MGT_HEAP_ID = __HYP_ALLOC_MGT_HEAP_ID_START__,
+	HYP_ALLOC_MGT_IOMMU_ID,
+	NR_ALLOC_MGT_IDS
+};
+
+unsigned long __pkvm_reclaim_hyp_alloc_mgt(unsigned long nr_pages);
+int __pkvm_topup_hyp_alloc_mgt_gfp(enum hyp_alloc_mgt_id id, unsigned long nr_pages,
+				   unsigned long sz_alloc, gfp_t gfp);
+
+>>>>>>> 77e1412f9301 (ANDROID: KVM: arm64: Expose the number of hypervisor heaps to the kernel)
 #ifndef __KVM_NVHE_HYPERVISOR__
 struct kvm_iommu_driver {
 	int (*init_driver)(void);
