@@ -1902,8 +1902,8 @@ enum hyp_alloc_mgt_id {
 
 unsigned long __pkvm_reclaim_hyp_alloc_mgt_id(enum hyp_alloc_mgt_id id, unsigned long nr_pages);
 unsigned long __pkvm_reclaim_hyp_alloc_mgt(unsigned long nr_pages);
-int __pkvm_topup_hyp_alloc_mgt_gfp(enum hyp_alloc_mgt_id id, unsigned long nr_pages,
-				   unsigned long sz_alloc, gfp_t gfp);
+unsigned long __pkvm_free_iommu_hyp_memcache(struct kvm_hyp_memcache *mc);
+int __pkvm_topup_hyp_iommu(unsigned long nr_pages, unsigned long sz_alloc, gfp_t gfp);
 
 >>>>>>> 77e1412f9301 (ANDROID: KVM: arm64: Expose the number of hypervisor heaps to the kernel)
 #ifndef __KVM_NVHE_HYPERVISOR__
