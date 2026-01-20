@@ -148,6 +148,9 @@ static inline bool kvm_pkvm_ioctl_allowed(struct kvm *kvm, unsigned int ioctl)
 	return kvm_pkvm_ext_allowed(kvm, ext);
 }
 
+extern phys_addr_t kvm_nvhe_sym(host_s2_cma_base);
+extern phys_addr_t kvm_nvhe_sym(host_s2_cma_size);
+
 extern struct memblock_region kvm_nvhe_sym(hyp_memory)[];
 extern unsigned int kvm_nvhe_sym(hyp_memblock_nr);
 
