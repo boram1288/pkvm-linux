@@ -249,7 +249,6 @@ struct iommu_domain {
 			struct list_head next;
 		};
 	};
-	ANDROID_VENDOR_DATA_ARRAY(1, 2);
 };
 
 static inline bool iommu_is_dma_domain(struct iommu_domain *domain)
