@@ -32,6 +32,12 @@
 
 ## 참고
 
-`v6.18..pkvm-6.18-full` 기준으로 237개 파일에 pKVM 관련 변경이 포함되어 있으며,
+README 문서화 커밋을 제외한 `v6.18..pkvm-6.18-full` 기준 pKVM 패치 규모는 다음과 같습니다.
+
+- 커밋 수: 721개
+- 변경 파일 수: 237개
+- 추가 라인 수: 34,178줄
+- 삭제 라인 수: 3,506줄
+
 주요 변경은 `arch/arm64/kvm`, `arch/arm64/kvm/hyp/nvhe`, `drivers/iommu`,
 `drivers/vfio`, `drivers/virt/coco/pkvm-guest`, `drivers/misc/pkvm-smc`에 집중되어 있습니다.
