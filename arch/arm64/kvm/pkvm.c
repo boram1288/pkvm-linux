@@ -1078,6 +1078,15 @@ static int __pkvm_pgtable_stage2_unmap(struct kvm_pgtable *pgt, u64 start, u64 e
 		kfree(mapping);
 	}
 
+	/*
+	 * Reclaim maps donated pages back into the host stage-2. Unlike a vCPU
+	 * exit, teardown cannot request a top-up after a guest mapping has been
+	 * destroyed, so seed the host stage-2 pool before reclaim starts.
+	 */
+	ret = pkvm_host_stage2_topup();
+	if (WARN_ON(ret))
+		return ret;
+
 retry:
 	pages = 0;
 	nr_busy = 0;
