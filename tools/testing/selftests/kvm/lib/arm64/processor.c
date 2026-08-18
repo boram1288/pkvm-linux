@@ -646,7 +646,9 @@ void aarch64_get_supported_page_sizes(uint32_t ipa, uint32_t *ipa4k,
 		     : [function_id] "r"(function_id), [arg0] "r"(arg0),	\
 		       [arg1] "r"(arg1), [arg2] "r"(arg2), [arg3] "r"(arg3),	\
 		       [arg4] "r"(arg4), [arg5] "r"(arg5), [arg6] "r"(arg6)	\
-		     : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7")
+		     : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", \
+		       "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", \
+		       "x16", "x17")
 
 
 void smccc_hvc(uint32_t function_id, uint64_t arg0, uint64_t arg1,

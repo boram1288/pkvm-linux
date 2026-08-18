@@ -2050,7 +2050,8 @@ free_drv_info:
 	kfree(drv_info);
 	return ret;
 }
-rootfs_initcall(ffa_init);
+/* pKVM must install its FF-A proxy before the host maps its RX/TX buffers. */
+late_initcall(ffa_init);
 
 static void __exit ffa_exit(void)
 {

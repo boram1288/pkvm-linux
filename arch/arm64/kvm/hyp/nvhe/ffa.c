@@ -43,6 +43,7 @@
 
 #define VM_FFA_SUPPORTED(vcpu)		((vcpu)->kvm->arch.pkvm.ffa_support)
 #define FFA_INVALID_SPM_HANDLE		(BIT(63) - 1)
+#define FFA_MAX_HOST_HANDLE_RANGES	64
 
 /* The maximum number of secure partitions that can register for VM availability */
 #define FFA_MAX_VM_AVAIL_SPS	(8)
@@ -74,6 +75,8 @@ struct ffa_translation {
 struct ffa_handle {
 	u64	handle: 63;
 	u64	is_lend: 1;
+	struct ffa_mem_region_addr_range ranges[FFA_MAX_HOST_HANDLE_RANGES];
+	u32 nranges;
 };
 
 /*
@@ -433,7 +436,9 @@ static int kvm_notify_vm_availability(uint16_t vm_handle, struct kvm_ffa_buffers
 			.a1 = dest,
 		};
 		nvhe_arm_smccc_1_2_smc(&res, &res);
-		if (res.a0 == FFA_ERROR && (int)res.a2 != FFA_RET_NOT_SUPPORTED)
+		if (res.a0 == FFA_ERROR &&
+		    (int)res.a2 != FFA_RET_NOT_SUPPORTED &&
+		    (int)res.a2 != FFA_RET_INVALID_PARAMETERS)
 			return ffa_to_linux_errno(res.a2);
 		else if (res.a0 == FFA_INTERRUPT)
 			return -EINTR;
@@ -880,7 +885,7 @@ static void do_ffa_mem_frag_tx(struct arm_smccc_1_2_regs *res,
 	struct kvm_ffa_buffers *ffa_buf;
 	bool is_lend = false;
 	u64 host_handle = PACK_HANDLE(handle_lo, handle_hi);
-	struct ffa_handle *entry;
+	struct ffa_handle *entry = NULL;
 
 	if (fraglen > KVM_FFA_MBOX_NR_PAGES * PAGE_SIZE)
 		goto out;
@@ -920,6 +925,17 @@ static void do_ffa_mem_frag_tx(struct arm_smccc_1_2_regs *res,
 		ffa_mem_reclaim(res, handle_lo, handle_hi, 0);
 		WARN_ON(res->a0 != FFA_SUCCESS);
 		goto out_unlock;
+	}
+
+	if (entry) {
+		if (entry->nranges + nr_ranges > FFA_MAX_HOST_HANDLE_RANGES) {
+			WARN_ON(ffa_host_unshare_ranges(buf, nr_ranges, is_lend));
+			ffa_to_smccc_error(res, FFA_RET_NO_MEMORY);
+			goto out_unlock;
+		}
+		memcpy(entry->ranges + entry->nranges, buf,
+		       nr_ranges * sizeof(*buf));
+		entry->nranges += nr_ranges;
 	}
 
 	ffa_mem_frag_tx(res, handle_lo, handle_hi, fraglen, endpoint_id);
@@ -1084,11 +1100,22 @@ static int __do_ffa_mem_xfer(const u64 func_id,
 		goto out_unlock;
 
 	if (!hyp_vcpu && static_branch_unlikely(&kvm_ffa_unmap_on_lend)) {
+		/* Keep the host ranges locally; OP-TEE SPMC has no retrieve ABI. */
+		if (nr_ranges > FFA_MAX_HOST_HANDLE_RANGES) {
+			ret = -EOPNOTSUPP;
+			goto err_unshare;
+		}
+
 		handle = ffa_host_alloc_handle();
 		if (!handle) {
 			ret = -ENOSPC;
-			goto out_unlock;
+			goto err_unshare;
 		}
+
+		handle->nranges = 0;
+		memcpy(handle->ranges, reg->constituents,
+		       nr_ranges * sizeof(*reg->constituents));
+		handle->nranges = nr_ranges;
 	}
 
 	ffa_mem_xfer(res, func_id, len, fraglen);
@@ -1123,6 +1150,9 @@ out_unlock:
 		ffa_to_smccc_res(res, linux_errno_to_ffa(ret));
 	return ret;
 err_unshare:
+	if (handle) {
+		handle->nranges = 0;
+	}
 	if (hyp_vcpu)
 		ffa_guest_unshare_ranges(hyp_vcpu, transfer);
 	else
@@ -1190,6 +1220,16 @@ static void do_ffa_mem_reclaim(struct arm_smccc_1_2_regs *res,
 			}
 
 			is_lend = entry->is_lend;
+
+			ffa_mem_reclaim(res, handle_lo, handle_hi, flags);
+			if (res->a0 != FFA_SUCCESS)
+				goto out_unlock;
+
+			WARN_ON(ffa_host_unshare_ranges(entry->ranges,
+						entry->nranges, is_lend));
+			entry->nranges = 0;
+			ffa_host_clear_handle(handle);
+			goto out_unlock;
 		}
 	}
 

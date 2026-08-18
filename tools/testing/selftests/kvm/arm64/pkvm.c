@@ -26,7 +26,18 @@ enum guest_commands {
 	CMD_HEARTBEAT = 1,	/* Lets host know that guest is alive. */
 	CMD_INC,		/* Ask host to increment shared/relinquished page. */
 	CMD_INC_PRIVATE,	/* Ask host to increment private page. */
+	CMD_FFA_OK,		/* Guest negotiated FF-A and obtained its endpoint ID. */
+	CMD_FFA_NEGATIVE_OK,	/* Invalid FF-A requests were rejected. */
 };
+
+#define FFA_ERROR		0x84000060U
+#define FFA_SUCCESS		0x84000061U
+#define FFA_VERSION		0x84000063U
+#define FFA_FN64_RXTX_MAP	0xc4000066U
+#define FFA_ID_GET		0x84000069U
+#define FFA_MSG_SEND_DIRECT_REQ	0x8400006fU
+#define FFA_MEM_SHARE		0x84000073U
+#define FFA_VERSION_1_2		0x00010002U
 
 #define  PC(v)  ((uint64_t)&(v))
 
@@ -121,6 +132,29 @@ static unsigned long smccc_status(uint32_t func, uint64_t arg)
 
 	smccc(func, arg, &res);
 	return res.a0;
+}
+
+static void test_ffa(void)
+{
+	struct arm_smccc_res res;
+
+	smccc(FFA_VERSION, FFA_VERSION_1_2, &res);
+	GUEST_ASSERT_EQ(res.a0, FFA_VERSION_1_2);
+
+	smccc(FFA_ID_GET, 0, &res);
+	GUEST_ASSERT_EQ(res.a0, FFA_SUCCESS);
+	GUEST_ASSERT(res.a2 && res.a2 <= UINT16_MAX);
+
+	GUEST_SYNC(CMD_FFA_OK);
+
+	/* Zero addresses/count, empty descriptor, and unknown endpoint. */
+	smccc(FFA_FN64_RXTX_MAP, 0, &res);
+	GUEST_ASSERT_EQ(res.a0, FFA_ERROR);
+	smccc(FFA_MEM_SHARE, 0, &res);
+	GUEST_ASSERT_EQ(res.a0, FFA_ERROR);
+	smccc(FFA_MSG_SEND_DIRECT_REQ, 0x8fff0000U, &res);
+	GUEST_ASSERT_EQ(res.a0, FFA_ERROR);
+	GUEST_SYNC(CMD_FFA_NEGATIVE_OK);
 }
 
 /*
@@ -504,6 +538,7 @@ static void guest_code(vm_paddr_t ucall_pool_phys, size_t ucall_pool_size,
 	map_ucall_mmio(ucall_mmio_phys);
 
 	GUEST_SYNC(CMD_HEARTBEAT);
+	test_ffa();
 
 	test_mmio_guard();
 
@@ -533,11 +568,17 @@ static struct kvm_vm *test_vm_create_protected(struct kvm_vcpu **vcpu)
 {
 	extern char pvm_entry_start[], pvm_entry_end[];
 	struct vm_shape shape = VM_SHAPE_DEFAULT;
+	struct kvm_enable_cap ffa_cap = {
+		.cap = KVM_CAP_ARM_PROTECTED_VM,
+		.flags = KVM_CAP_ARM_PROTECTED_VM_FLAGS_SET_FFA,
+		.args[0] = 1,
+	};
 	vm_paddr_t idmap_gpa;
 	struct kvm_vm *vm;
 
 	shape.type = VM_TYPE_PROTECTED;
 	vm = vm_create_shape_with_one_vcpu(shape, vcpu, NULL);
+	vm_ioctl(vm, KVM_ENABLE_CAP, &ffa_cap);
 
 	idmap_gpa = vm_compute_max_gfn(vcpu[0]->vm) * vm->page_size;
 	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS, idmap_gpa, 2, 1, 0);
@@ -687,6 +728,14 @@ static void handle_cmd(struct kvm_vm *vm, int cmd)
 		break;
 	case CMD_INC_PRIVATE:
 		cmd_inc_private(vm);
+		break;
+	case CMD_FFA_OK:
+		pr_info("PVM_FFA_MINIMAL_OK\n");
+		/* Keep the VM active long enough for coexistence observers. */
+		usleep(500000);
+		break;
+	case CMD_FFA_NEGATIVE_OK:
+		pr_info("PVM_FFA_NEGATIVE_OK: bad_rxtx bad_share bad_endpoint\n");
 		break;
 	default:
 		TEST_FAIL("Unexpected guest command: %d\n", cmd);

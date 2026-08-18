@@ -88,9 +88,6 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
 {
 	int r = -EINVAL;
 
-	if (cap->flags)
-		return -EINVAL;
-
 	if (is_protected_kvm_enabled() && !kvm_pkvm_ext_allowed(kvm, cap->cap))
 		return -EINVAL;
 
