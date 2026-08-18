@@ -774,6 +774,28 @@ size_t kvm_iommu_unmap_pages(pkvm_handle_t domain_id, unsigned long iova,
 	return unmapped;
 }
 
+/*
+ * Cross-pVM revocation runs from the owner's teardown context, while the
+ * mapping belongs to the receiver. Select the receiver context so domain
+ * ownership checks and page-table reclamation use the receiver's IOMMU pool.
+ */
+size_t kvm_iommu_unmap_pages_for_vm(struct pkvm_hyp_vm *vm,
+				    pkvm_handle_t domain_id,
+				    unsigned long iova,
+				    size_t pgsize, size_t pgcount)
+{
+	struct pkvm_hyp_vcpu *saved_context = cur_context;
+	size_t unmapped;
+
+	if (WARN_ON(!vm || !vm->vcpus[0]))
+		return 0;
+	cur_context = vm->vcpus[0];
+	unmapped = kvm_iommu_unmap_pages(domain_id, iova, pgsize, pgcount);
+	cur_context = saved_context;
+
+	return unmapped;
+}
+
 phys_addr_t kvm_iommu_iova_to_phys(pkvm_handle_t domain_id, unsigned long iova)
 {
 	phys_addr_t phys = 0;

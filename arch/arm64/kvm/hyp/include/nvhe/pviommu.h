@@ -10,5 +10,7 @@
 
 bool kvm_handle_pviommu_hvc(struct kvm_vcpu *vcpu, u64 *exit_code);
 void kvm_iommu_teardown_guest_domains(struct pkvm_hyp_vm *hyp_vm);
+bool pkvm_guest_iommu_domain_owned(struct pkvm_hyp_vm *vm,
+				   pkvm_handle_t domain_id);
 
 #endif /* __ARM64_KVM_NVHE_PVIOMMU_H__ */

@@ -39,6 +39,7 @@ struct pkvm_device {
 	void *ctxt; /* Current context of the device */
 	unsigned short refcount;
 	bool power_locked;
+	bool hyp_owned;
 	struct pkvm_device_ops *ops;
 	void *cookie; /* cookie from drivers. */
 };

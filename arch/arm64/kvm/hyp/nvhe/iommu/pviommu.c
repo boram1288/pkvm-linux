@@ -24,6 +24,24 @@ static DEFINE_HYP_SPINLOCK(pviommu_guest_domain_lock);
 #define KVM_IOMMU_MAX_GUEST_DOMAINS		(KVM_IOMMU_MAX_DOMAINS >> 1)
 static unsigned long guest_domains[KVM_IOMMU_MAX_GUEST_DOMAINS / BITS_PER_LONG];
 
+bool pkvm_guest_iommu_domain_owned(struct pkvm_hyp_vm *vm,
+				   pkvm_handle_t domain_id)
+{
+	struct pviommu_guest_domain *guest_domain;
+	bool owned = false;
+
+	hyp_spin_lock(&pviommu_guest_domain_lock);
+	list_for_each_entry(guest_domain, &vm->domains, list) {
+		if (guest_domain->id == domain_id) {
+			owned = true;
+			break;
+		}
+	}
+	hyp_spin_unlock(&pviommu_guest_domain_lock);
+
+	return owned;
+}
+
 /*
  * Guests doens't have separate domain space as the host, but they share the upper half
  * of the domain ids, so they would ask for a domain and get a domain id as a return.
