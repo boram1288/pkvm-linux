@@ -18,6 +18,16 @@
 struct pkvm_device *registered_devices;
 unsigned long registered_devices_nr;
 
+static void pkvm_device_unmap_hyp_resource(u64 phys, u64 size)
+{
+	u64 off;
+
+	hyp_assert_lock_held(&pkvm_pgd_lock);
+	for (off = 0; off < size; off += PAGE_SIZE)
+		kvm_pgtable_hyp_unmap(&pkvm_pgtable,
+					(u64)__hyp_va(phys + off), PAGE_SIZE);
+}
+
 /*
  * This lock protects all devices in registered_devices when ctxt changes,
  * this is overlocking and can be improved. However, the device context
@@ -27,6 +37,51 @@ unsigned long registered_devices_nr;
  * of the device.
  */
 static DEFINE_HYP_SPINLOCK(device_spinlock);
+
+#ifdef CONFIG_PKVM_QEMU_EDU
+#define PKVM_QEMU_EDU_BASE		0x10000000UL
+#define PKVM_QEMU_EDU_SIZE		0x100000UL
+#define PKVM_QEMU_EDU_COUNT		2
+#define PKVM_QEMU_EDU_RESET		0xa0
+#define PKVM_QEMU_EDU_RESET_MAGIC	0x45535552U
+
+static int pkvm_qemu_edu_reset(void *cookie, bool host_to_guest)
+{
+	phys_addr_t phys = (phys_addr_t)cookie;
+	void *base = hyp_fixmap_map(phys);
+	void *reset = base + PKVM_QEMU_EDU_RESET;
+
+	asm volatile("str %w0, [%1]" : : "r" (PKVM_QEMU_EDU_RESET_MAGIC),
+		     "r" (reset));
+	dsb(sy);
+	hyp_fixmap_unmap();
+	return 0;
+}
+
+static struct pkvm_device_ops pkvm_qemu_edu_ops = {
+	.reset = pkvm_qemu_edu_reset,
+};
+
+static int pkvm_qemu_edu_init(void)
+{
+	int i, ret;
+
+	for (i = 0; i < PKVM_QEMU_EDU_COUNT; i++) {
+		unsigned long base = PKVM_QEMU_EDU_BASE + i * PKVM_QEMU_EDU_SIZE;
+
+		ret = pkvm_device_register_ops(base, &pkvm_qemu_edu_ops,
+					       (void *)base);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+#else
+static int pkvm_qemu_edu_init(void)
+{
+	return 0;
+}
+#endif
 
 int pkvm_init_devices(void)
 {
@@ -39,9 +94,12 @@ int pkvm_init_devices(void)
 
 	ret = __pkvm_host_donate_hyp(hyp_virt_to_phys(registered_devices) >> PAGE_SHIFT,
 				     dev_sz >> PAGE_SHIFT);
-	if (ret)
+	if (ret) {
 		registered_devices_nr = 0;
-	return ret;
+		return ret;
+	}
+
+	return pkvm_qemu_edu_init();
 }
 
 /* return device from a resource, addr and size must match. */
@@ -114,15 +172,27 @@ int pkvm_device_hyp_assign_mmio(u64 pfn, u64 nr_pages)
 
 	hyp_spin_lock(&device_spinlock);
 	/* A VM already have this device, no take backs. */
-	if (dev->ctxt || dev->refcount) {
+	if (dev->ctxt || dev->refcount || dev->hyp_owned) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
 
+	/*
+	 * Teardown can leave sparse direct-map entries for an MMIO resource:
+	 * faulted pages moved to the dying guest while untouched pages stayed at
+	 * EL2.  Make the Host -> Hyp donation start from a canonical NOPAGE
+	 * direct-map state; the permanent reset mapping uses a private VA.
+	 */
+	hyp_spin_lock(&pkvm_pgd_lock);
+	pkvm_device_unmap_hyp_resource(phys, size);
+	hyp_spin_unlock(&pkvm_pgd_lock);
+
 	ret = ___pkvm_host_donate_hyp_prot(pfn, nr_pages, true, PAGE_HYP_DEVICE);
 	/* Hyp have device mapping, while host may have issue cacheable writes.*/
-	if (!ret)
+	if (!ret) {
+		dev->hyp_owned = true;
 		kvm_flush_dcache_to_poc(__hyp_va(phys), PAGE_SIZE);
+	}
 
 out_unlock:
 	hyp_spin_unlock(&device_spinlock);
@@ -155,8 +225,14 @@ int pkvm_device_reclaim_mmio(u64 pfn, u64 nr_pages)
 		ret = -EBUSY;
 		goto out_unlock;
 	}
+	if (!dev->hyp_owned) {
+		ret = 0;
+		goto out_unlock;
+	}
 
 	ret = __pkvm_hyp_donate_host(pfn, nr_pages);
+	if (!ret)
+		dev->hyp_owned = false;
 
 out_unlock:
 	hyp_spin_unlock(&device_spinlock);
@@ -377,9 +453,20 @@ static void pkvm_devices_reclaim_device(struct pkvm_device *dev)
 		struct pkvm_dev_resource *res = &dev->resources[i];
 
 		hyp_spin_lock(&host_mmu.lock);
+		hyp_spin_lock(&pkvm_pgd_lock);
+		/*
+		 * Pages never faulted by the guest are still mapped privately at
+		 * EL2, while faulted pages have already moved into the guest stage-2.
+		 * Remove the whole residual EL2 range before returning ownership to
+		 * the host.  Holes are expected and are reclaimed with the guest
+		 * stage-2 immediately after this device teardown.
+		 */
+		pkvm_device_unmap_hyp_resource(res->base, res->size);
 		WARN_ON(host_stage2_set_owner_locked(res->base, res->size, PKVM_ID_HOST));
+		hyp_spin_unlock(&pkvm_pgd_lock);
 		hyp_spin_unlock(&host_mmu.lock);
 	}
+	dev->hyp_owned = false;
 }
 
 void pkvm_devices_teardown(struct pkvm_hyp_vm *vm)

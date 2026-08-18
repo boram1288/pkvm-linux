@@ -711,6 +711,7 @@ static int pkvm_init_devices(void)
 
 	if (!dev_base)
 		return -ENOMEM;
+	memset(dev_base, 0, dev_sz);
 
 	for_each_compatible_node(np, NULL, PKVM_DEVICE_ASSIGN_COMPAT) {
 		struct of_phandle_args args;

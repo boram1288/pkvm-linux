@@ -75,6 +75,25 @@ config IOMMU_POOL_PAGES
 	help
 	  IOMMU pool is used with protected mode to allocated IOMMU drivers page tables.
 
+config PKVM_QEMU_EDU
+	bool "pKVM QEMU edu assigned-device support"
+	depends on KVM
+	default n
+	help
+	  Register an EL2 reset callback for the QEMU edu device used by the
+	  protected-device assignment proof of concept.
+
+config PKVM_PVM_DMA_SHARE
+	bool "pKVM protected-VM peer DMA sharing"
+	depends on PKVM_PVIOMMU
+	default n
+	help
+	  Add an EL2-mediated, owner-authorized one-page DMA sharing service
+	  between protected VMs. The shared page is mapped only into the
+	  receiver's protected IOMMU domain and is revoked automatically when
+	  either VM is torn down. This is intended for the Phase 08 proof of
+	  concept and is not a stable guest ABI.
+
 menuconfig PKVM_DEBUG
 	bool "Debug mode for Protected KVM hypervisor"
 	help

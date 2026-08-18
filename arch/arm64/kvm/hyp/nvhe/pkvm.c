@@ -25,6 +25,9 @@
 #include <nvhe/mm.h>
 #include <nvhe/pkvm.h>
 #include <nvhe/pviommu.h>
+#ifdef CONFIG_PKVM_PVM_DMA_SHARE
+#include <nvhe/pvm-dma-share.h>
+#endif
 #include <nvhe/pviommu-host.h>
 #include <nvhe/trap_handler.h>
 
@@ -1186,6 +1189,9 @@ int __pkvm_finalize_teardown_vm(pkvm_handle_t handle)
 
 	pkvm_devices_teardown(hyp_vm);
 
+#ifdef CONFIG_PKVM_PVM_DMA_SHARE
+	pkvm_pvm_dma_share_teardown(hyp_vm);
+#endif
 	pkvm_pviommu_teardown(hyp_vm);
 
 	/*
@@ -2112,6 +2118,9 @@ bool kvm_handle_pvm_hvc64(struct kvm_vcpu *vcpu, u64 *exit_code)
 		__smccc_kvm_func_to_feature_args(val, ARM_SMCCC_KVM_FUNC_MMIO_RGUARD_UNMAP);
 		__smccc_kvm_func_to_feature_args(val, ARM_SMCCC_KVM_FUNC_MEM_RELINQUISH);
 		__smccc_kvm_func_to_feature_args(val, ARM_SMCCC_KVM_FUNC_DEV_REQ_PWR);
+#ifdef CONFIG_PKVM_PVM_DMA_SHARE
+		__smccc_kvm_func_to_feature_args(val, ARM_SMCCC_KVM_FUNC_PVM_DMA_SHARE);
+#endif
 		break;
 	case ARM_SMCCC_VENDOR_HYP_KVM_MMIO_GUARD_ENROLL_FUNC_ID:
 		set_bit(KVM_ARCH_FLAG_MMIO_GUARD, &vcpu->kvm->arch.flags);
@@ -2141,6 +2150,10 @@ bool kvm_handle_pvm_hvc64(struct kvm_vcpu *vcpu, u64 *exit_code)
 		break;
 	case ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID:
 		return kvm_handle_pviommu_hvc(vcpu, exit_code);
+#ifdef CONFIG_PKVM_PVM_DMA_SHARE
+	case ARM_SMCCC_VENDOR_HYP_KVM_PVM_DMA_SHARE_FUNC_ID:
+		return pkvm_pvm_dma_share_hvc(hyp_vcpu, exit_code);
+#endif
 	case ARM_SMCCC_VENDOR_HYP_KVM_DEV_REQ_MMIO_FUNC_ID:
 		return pkvm_device_request_mmio(hyp_vcpu, exit_code);
 	case ARM_SMCCC_VENDOR_HYP_KVM_DEV_REQ_DMA_FUNC_ID:
