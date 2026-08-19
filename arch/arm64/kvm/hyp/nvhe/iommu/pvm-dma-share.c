@@ -58,6 +58,244 @@ struct pvm_cpu_lease {
 static struct pvm_cpu_lease pvm_cpu_lease;
 static u64 pvm_cpu_next_token = 0x504b564d00000000ULL;
 
+#define PVM_MSG_MAX_ENDPOINT 2
+#define PVM_MSG_MAX_SIZE 256
+#define PVM_MSG_QUEUE_SIZE 64
+#define PVM_MSG_CHUNK_SIZE 24
+#define PVM_MSG_RET_QUEUE_FULL (-4)
+
+struct pvm_msg_entry {
+	u32 sender;
+	u32 len;
+	u64 sequence;
+	u8 data[PVM_MSG_MAX_SIZE];
+};
+
+struct pvm_msg_queue {
+	u32 head;
+	u32 count;
+	struct pvm_msg_entry entries[PVM_MSG_QUEUE_SIZE];
+};
+
+struct pvm_msg_staging {
+	bool active;
+	u32 receiver;
+	u32 len;
+	u32 written;
+	u8 data[PVM_MSG_MAX_SIZE];
+};
+
+static struct pvm_msg_queue pvm_msg_queues[PVM_MSG_MAX_ENDPOINT + 1];
+static struct pvm_msg_staging pvm_msg_staging[PVM_MSG_MAX_ENDPOINT + 1];
+static u64 pvm_msg_sequence;
+
+static bool pvm_msg_endpoint_valid(u32 endpoint)
+{
+	return endpoint > 0 && endpoint <= PVM_MSG_MAX_ENDPOINT;
+}
+
+static bool pvm_msg_peer_allowed(u32 sender, u32 receiver)
+{
+	return pvm_msg_endpoint_valid(sender) && pvm_msg_endpoint_valid(receiver) &&
+	       sender != receiver;
+}
+
+static bool pvm_msg_send_begin(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u32 sender = hyp_vcpu_to_endpoint_id(hyp_vcpu);
+	u32 receiver = smccc_get_arg2(vcpu);
+	u32 len = smccc_get_arg3(vcpu);
+	struct pvm_msg_staging *staging;
+
+	if (!pvm_msg_peer_allowed(sender, receiver) || !len || len > PVM_MSG_MAX_SIZE)
+		goto invalid;
+	hyp_spin_lock(&pvm_dma_share_lock);
+	staging = &pvm_msg_staging[sender];
+	if (staging->active) {
+		hyp_spin_unlock(&pvm_dma_share_lock);
+		goto invalid;
+	}
+	memset(staging, 0, sizeof(*staging));
+	staging->active = true;
+	staging->receiver = receiver;
+	staging->len = len;
+	hyp_spin_unlock(&pvm_dma_share_lock);
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, 0, 0, 0);
+	return true;
+invalid:
+	smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+	return true;
+}
+
+static bool pvm_msg_send_chunk(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u32 sender = hyp_vcpu_to_endpoint_id(hyp_vcpu);
+	u32 offset = smccc_get_arg2(vcpu);
+	u64 words[3] = { smccc_get_arg3(vcpu), smccc_get_arg4(vcpu), smccc_get_arg5(vcpu) };
+	struct pvm_msg_staging *staging;
+	u32 len;
+
+	if (!pvm_msg_endpoint_valid(sender))
+		goto invalid;
+	hyp_spin_lock(&pvm_dma_share_lock);
+	staging = &pvm_msg_staging[sender];
+	if (!staging->active || offset != staging->written || offset >= staging->len)
+		goto invalid_locked;
+	len = min_t(u32, PVM_MSG_CHUNK_SIZE, staging->len - offset);
+	memcpy(staging->data + offset, words, len);
+	staging->written += len;
+	hyp_spin_unlock(&pvm_dma_share_lock);
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, len, 0, 0);
+	return true;
+invalid_locked:
+	hyp_spin_unlock(&pvm_dma_share_lock);
+invalid:
+	smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+	return true;
+}
+
+static bool pvm_msg_send_commit(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u32 sender = hyp_vcpu_to_endpoint_id(hyp_vcpu);
+	struct pvm_msg_staging *staging;
+	struct pvm_msg_queue *queue;
+	struct pvm_msg_entry *entry;
+	u64 sequence;
+
+	if (!pvm_msg_endpoint_valid(sender))
+		goto invalid;
+	hyp_spin_lock(&pvm_dma_share_lock);
+	staging = &pvm_msg_staging[sender];
+	if (!staging->active || staging->written != staging->len)
+		goto invalid_locked;
+	queue = &pvm_msg_queues[staging->receiver];
+	if (queue->count == PVM_MSG_QUEUE_SIZE) {
+		memset(staging, 0, sizeof(*staging));
+		hyp_spin_unlock(&pvm_dma_share_lock);
+		smccc_set_retval(vcpu, PVM_MSG_RET_QUEUE_FULL, 0, 0, 0);
+		return true;
+	}
+	entry = &queue->entries[(queue->head + queue->count) % PVM_MSG_QUEUE_SIZE];
+	memset(entry, 0, sizeof(*entry));
+	entry->sender = sender;
+	entry->len = staging->len;
+	sequence = ++pvm_msg_sequence;
+	entry->sequence = sequence;
+	memcpy(entry->data, staging->data, staging->len);
+	queue->count++;
+	memset(staging, 0, sizeof(*staging));
+	hyp_spin_unlock(&pvm_dma_share_lock);
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, sequence, 0, 0);
+	return true;
+invalid_locked:
+	hyp_spin_unlock(&pvm_dma_share_lock);
+invalid:
+	smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+	return true;
+}
+
+static bool pvm_msg_recv_info(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u32 receiver = hyp_vcpu_to_endpoint_id(hyp_vcpu);
+	struct pvm_msg_queue *queue;
+	struct pvm_msg_entry *entry;
+
+	if (!pvm_msg_endpoint_valid(receiver))
+		goto invalid;
+	hyp_spin_lock(&pvm_dma_share_lock);
+	queue = &pvm_msg_queues[receiver];
+	if (!queue->count)
+		goto invalid_locked;
+	entry = &queue->entries[queue->head];
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, entry->sender, entry->len,
+			 entry->sequence);
+	__kvm_inject_el1_irq_live(vcpu);
+	hyp_spin_unlock(&pvm_dma_share_lock);
+	return true;
+invalid_locked:
+	hyp_spin_unlock(&pvm_dma_share_lock);
+invalid:
+	smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+	return true;
+}
+
+static bool pvm_msg_recv_chunk(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u32 receiver = hyp_vcpu_to_endpoint_id(hyp_vcpu);
+	u32 offset = smccc_get_arg2(vcpu);
+	struct pvm_msg_queue *queue;
+	struct pvm_msg_entry *entry;
+	u64 words[3] = { 0 };
+	u32 len;
+
+	if (!pvm_msg_endpoint_valid(receiver))
+		goto invalid;
+	hyp_spin_lock(&pvm_dma_share_lock);
+	queue = &pvm_msg_queues[receiver];
+	if (!queue->count)
+		goto invalid_locked;
+	entry = &queue->entries[queue->head];
+	if (offset >= entry->len)
+		goto invalid_locked;
+	len = min_t(u32, PVM_MSG_CHUNK_SIZE, entry->len - offset);
+	memcpy(words, entry->data + offset, len);
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, words[0], words[1], words[2]);
+	hyp_spin_unlock(&pvm_dma_share_lock);
+	return true;
+invalid_locked:
+	hyp_spin_unlock(&pvm_dma_share_lock);
+invalid:
+	smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+	return true;
+}
+
+static bool pvm_msg_recv_pop(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u32 receiver = hyp_vcpu_to_endpoint_id(hyp_vcpu);
+	struct pvm_msg_queue *queue;
+
+	if (!pvm_msg_endpoint_valid(receiver))
+		goto invalid;
+	hyp_spin_lock(&pvm_dma_share_lock);
+	queue = &pvm_msg_queues[receiver];
+	if (!queue->count)
+		goto invalid_locked;
+	memset(&queue->entries[queue->head], 0, sizeof(queue->entries[0]));
+	queue->head = (queue->head + 1) % PVM_MSG_QUEUE_SIZE;
+	queue->count--;
+	hyp_spin_unlock(&pvm_dma_share_lock);
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, 0, 0, 0);
+	return true;
+invalid_locked:
+	hyp_spin_unlock(&pvm_dma_share_lock);
+invalid:
+	smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+	return true;
+}
+
+static bool pvm_msg_queue_depth(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u32 endpoint = hyp_vcpu_to_endpoint_id(hyp_vcpu);
+	u32 count;
+	if (!pvm_msg_endpoint_valid(endpoint))
+		goto invalid;
+	hyp_spin_lock(&pvm_dma_share_lock);
+	count = pvm_msg_queues[endpoint].count;
+	hyp_spin_unlock(&pvm_dma_share_lock);
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, count, PVM_MSG_QUEUE_SIZE, 0);
+	return true;
+invalid:
+	smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+	return true;
+}
+
 static bool pvm_dma_share_has_request(struct kvm_vcpu *vcpu)
 {
 	return vcpu->arch.hyp_reqs->type != KVM_HYP_LAST_REQ;
@@ -531,6 +769,20 @@ bool pkvm_pvm_dma_share_hvc(struct pkvm_hyp_vcpu *hyp_vcpu,
 		return pvm_cpu_lease_event_poll(hyp_vcpu);
 	case KVM_PVM_DMA_SHARE_ID_GET:
 		return pvm_cpu_lease_id_get(hyp_vcpu);
+	case KVM_PVM_MSG_SEND_BEGIN:
+		return pvm_msg_send_begin(hyp_vcpu);
+	case KVM_PVM_MSG_SEND_CHUNK:
+		return pvm_msg_send_chunk(hyp_vcpu);
+	case KVM_PVM_MSG_SEND_COMMIT:
+		return pvm_msg_send_commit(hyp_vcpu);
+	case KVM_PVM_MSG_RECV_INFO:
+		return pvm_msg_recv_info(hyp_vcpu);
+	case KVM_PVM_MSG_RECV_CHUNK:
+		return pvm_msg_recv_chunk(hyp_vcpu);
+	case KVM_PVM_MSG_RECV_POP:
+		return pvm_msg_recv_pop(hyp_vcpu);
+	case KVM_PVM_MSG_QUEUE_DEPTH:
+		return pvm_msg_queue_depth(hyp_vcpu);
 	default:
 		smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
 		return true;
@@ -543,5 +795,7 @@ void pkvm_pvm_dma_share_teardown(struct pkvm_hyp_vm *vm)
 	__pvm_cpu_lease_revoke(vm);
 	if (pvm_dma_share.owner == vm || pvm_dma_share.receiver == vm)
 		__pvm_dma_share_revoke();
+	memset(pvm_msg_queues, 0, sizeof(pvm_msg_queues));
+	memset(pvm_msg_staging, 0, sizeof(pvm_msg_staging));
 	hyp_spin_unlock(&pvm_dma_share_lock);
 }
