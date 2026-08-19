@@ -182,6 +182,34 @@ static void enter_exception64(struct kvm_vcpu *vcpu, unsigned long target_mode,
 }
 
 /*
+ * Inject an IRQ while handling an EL2-fast-path HVC. The nVHE run loop
+ * re-enters the guest without restoring the saved sysreg context, so update
+ * both the saved context and the live exception registers.
+ */
+void __kvm_inject_el1_irq_live(struct kvm_vcpu *vcpu)
+{
+	u64 old = read_sysreg_el2(SYS_SPSR);
+	u64 return_pc = read_sysreg_el2(SYS_ELR);
+	u64 vbar = __vcpu_read_sys_reg(vcpu, VBAR_EL1);
+	u64 sctlr = __vcpu_read_sys_reg(vcpu, SCTLR_EL1);
+	u64 offset, new;
+
+	offset = get_except64_offset(old, PSR_MODE_EL1h, except_type_irq);
+	new = get_except64_cpsr(old, kvm_has_mte(kern_hyp_va(vcpu->kvm)),
+				sctlr, PSR_MODE_EL1h);
+
+	write_sysreg_el1(return_pc, SYS_ELR);
+	write_sysreg_el1(old, SYS_SPSR);
+	write_sysreg_el2(vbar + offset, SYS_ELR);
+	write_sysreg_el2(new, SYS_SPSR);
+
+	*vcpu_pc(vcpu) = vbar + offset;
+	*vcpu_cpsr(vcpu) = new;
+	__vcpu_assign_sys_reg(vcpu, ELR_EL1, return_pc);
+	__vcpu_assign_sys_reg(vcpu, SPSR_EL1, old);
+}
+
+/*
  * When an exception is taken, most CPSR fields are left unchanged in the
  * handler. However, some are explicitly overridden (e.g. M[4:0]).
  *
@@ -347,6 +375,9 @@ static void kvm_inject_exception(struct kvm_vcpu *vcpu)
 		switch (vcpu_get_flag(vcpu, EXCEPT_MASK)) {
 		case unpack_vcpu_flag(EXCEPT_AA64_EL1_SYNC):
 			enter_exception64(vcpu, PSR_MODE_EL1h, except_type_sync);
+			break;
+		case unpack_vcpu_flag(EXCEPT_AA64_EL1_IRQ):
+			enter_exception64(vcpu, PSR_MODE_EL1h, except_type_irq);
 			break;
 
 		case unpack_vcpu_flag(EXCEPT_AA64_EL1_SERR):

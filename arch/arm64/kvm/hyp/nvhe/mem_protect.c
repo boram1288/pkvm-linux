@@ -1254,6 +1254,8 @@ static enum pkvm_page_state guest_get_page_state(kvm_pte_t pte, u64 addr)
 			state |= PKVM_MMIO;
 		else if (pte == KVM_ACCEPT_MODULE_PROT_NOTE)
 			state |= PKVM_ACCEPT_MODULE_OWNED;
+		else if (pte == KVM_PVM_LEASE_PROT_NOTE)
+			state |= PKVM_PVM_LEASED;
 
 		return state;
 	}
@@ -1596,6 +1598,217 @@ unlock:
 	guest_unlock_component(vm);
 
 	return ret;
+}
+
+static void guest_lock_two_components(struct pkvm_hyp_vm *first,
+				      struct pkvm_hyp_vm *second)
+{
+	if ((unsigned long)first < (unsigned long)second) {
+		hyp_spin_lock(&first->pgtable_lock);
+		hyp_spin_lock(&second->pgtable_lock);
+	} else {
+		hyp_spin_lock(&second->pgtable_lock);
+		hyp_spin_lock(&first->pgtable_lock);
+	}
+}
+
+static void guest_unlock_two_components(struct pkvm_hyp_vm *first,
+					struct pkvm_hyp_vm *second)
+{
+	current_vm = NULL;
+	if ((unsigned long)first < (unsigned long)second) {
+		hyp_spin_unlock(&second->pgtable_lock);
+		hyp_spin_unlock(&first->pgtable_lock);
+	} else {
+		hyp_spin_unlock(&first->pgtable_lock);
+		hyp_spin_unlock(&second->pgtable_lock);
+	}
+}
+
+/*
+ * Move one owned page from the owner pVM stage-2 to a receiver pVM stage-2.
+ * This is intentionally separate from the host-share helpers: the host page
+ * state remains NOPAGE throughout, so Host cannot regain a CPU mapping while
+ * the lease is active.
+ */
+int __pkvm_guest_export_page(struct pkvm_hyp_vcpu *owner_vcpu, u64 owner_ipa,
+			     struct pkvm_hyp_vm *receiver, u64 receiver_ipa,
+			     struct kvm_hyp_memcache *receiver_mc,
+			     phys_addr_t *phys)
+{
+	struct pkvm_hyp_vm *owner = pkvm_hyp_vcpu_to_hyp_vm(owner_vcpu);
+	kvm_pte_t owner_pte, receiver_pte;
+	s8 owner_level, receiver_level;
+	phys_addr_t pa;
+	int ret;
+
+	if (!receiver || receiver == owner || !PAGE_ALIGNED(owner_ipa) ||
+	    !PAGE_ALIGNED(receiver_ipa) || !phys || !receiver_mc)
+		return -EINVAL;
+
+	host_lock_component();
+	guest_lock_two_components(owner, receiver);
+	ret = kvm_pgtable_get_leaf(&owner->pgt, owner_ipa, &owner_pte, &owner_level);
+	if (ret || !kvm_pte_valid(owner_pte) ||
+	    kvm_granule_size(owner_level) != PAGE_SIZE ||
+	    guest_get_page_state(owner_pte, owner_ipa) != PKVM_PAGE_OWNED) {
+		ret = -EPERM;
+		goto unlock;
+	}
+
+	pa = kvm_pte_to_phys(owner_pte);
+	ret = __host_check_page_state_range(pa, PAGE_SIZE, PKVM_NOPAGE);
+	if (ret)
+		goto unlock;
+
+	ret = kvm_pgtable_get_leaf(&receiver->pgt, receiver_ipa,
+				   &receiver_pte, &receiver_level);
+	if (!ret && kvm_pte_valid(receiver_pte)) {
+		ret = -EEXIST;
+		goto unlock;
+	}
+
+	current_vm = owner;
+	ret = kvm_pgtable_stage2_unmap(&owner->pgt, owner_ipa, PAGE_SIZE);
+	if (ret)
+		goto unlock;
+	ret = kvm_pgtable_stage2_annotate(&owner->pgt, owner_ipa, PAGE_SIZE,
+					  receiver_mc, KVM_PVM_LEASE_PROT_NOTE);
+	if (ret) {
+		WARN_ON(kvm_pgtable_stage2_map(&owner->pgt, owner_ipa, PAGE_SIZE, pa,
+					       pkvm_mkstate(KVM_PGTABLE_PROT_RWX,
+							     PKVM_PAGE_OWNED),
+					       receiver_mc, 0));
+		goto unlock;
+	}
+
+	current_vm = receiver;
+	ret = kvm_pgtable_stage2_map(&receiver->pgt, receiver_ipa, PAGE_SIZE, pa,
+				     pkvm_mkstate(KVM_PGTABLE_PROT_RWX,
+						   PKVM_PAGE_SHARED_BORROWED),
+				     receiver_mc, 0);
+	if (ret) {
+		/* Restore the owner mapping before exposing the failure. */
+		current_vm = owner;
+		WARN_ON(kvm_pgtable_stage2_unmap(&owner->pgt, owner_ipa,
+						 PAGE_SIZE));
+		WARN_ON(kvm_pgtable_stage2_map(&owner->pgt, owner_ipa, PAGE_SIZE, pa,
+					       pkvm_mkstate(KVM_PGTABLE_PROT_RWX,
+							     PKVM_PAGE_OWNED),
+					       receiver_mc, 0));
+		goto unlock;
+	}
+
+	*phys = pa;
+	ret = 0;
+unlock:
+	guest_unlock_two_components(owner, receiver);
+	host_unlock_component();
+	return ret;
+}
+
+int __pkvm_guest_return_page(struct pkvm_hyp_vcpu *owner_vcpu, u64 owner_ipa,
+			     struct pkvm_hyp_vm *receiver, u64 receiver_ipa,
+			     phys_addr_t phys)
+{
+	struct pkvm_hyp_vm *owner = pkvm_hyp_vcpu_to_hyp_vm(owner_vcpu);
+	kvm_pte_t owner_pte, pte;
+	s8 level;
+	int ret;
+
+	if (!receiver || receiver == owner || !PAGE_ALIGNED(owner_ipa) ||
+	    !PAGE_ALIGNED(receiver_ipa))
+		return -EINVAL;
+
+	host_lock_component();
+	guest_lock_two_components(owner, receiver);
+	ret = kvm_pgtable_get_leaf(&owner->pgt, owner_ipa, &owner_pte, &level);
+	if (ret || owner_pte != KVM_PVM_LEASE_PROT_NOTE) {
+		ret = -EPERM;
+		goto unlock;
+	}
+	ret = kvm_pgtable_get_leaf(&receiver->pgt, receiver_ipa, &pte, &level);
+	if (ret || !kvm_pte_valid(pte) || kvm_granule_size(level) != PAGE_SIZE ||
+	    kvm_pte_to_phys(pte) != phys ||
+	    guest_get_page_state(pte, receiver_ipa) != PKVM_PAGE_SHARED_BORROWED) {
+		ret = -EPERM;
+		goto unlock;
+	}
+
+	ret = __host_check_page_state_range(phys, PAGE_SIZE, PKVM_NOPAGE);
+	if (ret)
+		goto unlock;
+
+	current_vm = receiver;
+	ret = kvm_pgtable_stage2_unmap(&receiver->pgt, receiver_ipa, PAGE_SIZE);
+	if (ret)
+		goto unlock;
+
+	current_vm = owner;
+	ret = kvm_pgtable_stage2_unmap(&owner->pgt, owner_ipa, PAGE_SIZE);
+	if (ret) {
+		current_vm = receiver;
+		WARN_ON(kvm_pgtable_stage2_map(&receiver->pgt, receiver_ipa,
+					       PAGE_SIZE, phys,
+					       pkvm_mkstate(KVM_PGTABLE_PROT_RWX,
+							     PKVM_PAGE_SHARED_BORROWED),
+					       &owner_vcpu->vcpu.arch.stage2_mc, 0));
+		goto unlock;
+	}
+	ret = kvm_pgtable_stage2_map(&owner->pgt, owner_ipa, PAGE_SIZE, phys,
+				     pkvm_mkstate(KVM_PGTABLE_PROT_RWX,
+						   PKVM_PAGE_OWNED),
+				     &owner_vcpu->vcpu.arch.stage2_mc, 0);
+	if (ret) {
+		WARN_ON(kvm_pgtable_stage2_annotate(&owner->pgt, owner_ipa,
+						  PAGE_SIZE,
+						  &owner_vcpu->vcpu.arch.stage2_mc,
+						  KVM_PVM_LEASE_PROT_NOTE));
+		current_vm = receiver;
+		WARN_ON(kvm_pgtable_stage2_map(&receiver->pgt, receiver_ipa, PAGE_SIZE,
+					       phys, pkvm_mkstate(KVM_PGTABLE_PROT_RWX,
+								    PKVM_PAGE_SHARED_BORROWED),
+					       &owner_vcpu->vcpu.arch.stage2_mc, 0));
+	}
+unlock:
+	guest_unlock_two_components(owner, receiver);
+	host_unlock_component();
+	return ret;
+}
+
+bool __pkvm_inject_pvm_lease_abort(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+	unsigned long cpsr = *vcpu_cpsr(vcpu);
+	kvm_pte_t pte;
+	u64 ipa;
+	u32 esr;
+	s8 level;
+	int ret;
+
+	if (!kvm_vcpu_dabt_isvalid(vcpu))
+		return false;
+
+	ipa = kvm_vcpu_get_fault_ipa(vcpu);
+	ipa |= kvm_vcpu_get_hfar(vcpu) & FAR_MASK;
+	guest_lock_component(vm);
+	ret = kvm_pgtable_get_leaf(&vm->pgt, ipa, &pte, &level);
+	guest_unlock_component(vm);
+	if (ret || kvm_granule_size(level) != PAGE_SIZE ||
+	    pte != KVM_PVM_LEASE_PROT_NOTE)
+		return false;
+
+	esr = ESR_ELx_IL | ESR_ELx_FSC_EXTABT;
+	if ((cpsr & PSR_MODE_MASK) == PSR_MODE_EL0t)
+		esr |= ESR_ELx_EC_DABT_LOW << ESR_ELx_EC_SHIFT;
+	else
+		esr |= ESR_ELx_EC_DABT_CUR << ESR_ELx_EC_SHIFT;
+	__vcpu_assign_sys_reg(vcpu, ESR_EL1, esr);
+	__vcpu_assign_sys_reg(vcpu, FAR_EL1, kvm_vcpu_get_hfar(vcpu));
+	kvm_pend_exception(vcpu, EXCEPT_AA64_EL1_SYNC);
+
+	return true;
 }
 
 static int pkvm_host_donate_hyp(u64 pfn, u64 nr_pages, enum kvm_pgtable_prot prot,

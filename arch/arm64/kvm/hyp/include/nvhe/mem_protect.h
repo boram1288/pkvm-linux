@@ -53,6 +53,15 @@ int __pkvm_guest_share_hyp_page(struct pkvm_hyp_vcpu *vcpu, u64 ipa, u64 *hyp_va
 int __pkvm_guest_unshare_hyp_page(struct pkvm_hyp_vcpu *vcpu, u64 ipa);
 int __pkvm_guest_share_ffa_page(struct pkvm_hyp_vcpu *vcpu, u64 ipa, phys_addr_t *phys);
 int __pkvm_guest_unshare_ffa_page(struct pkvm_hyp_vcpu *vcpu, u64 ipa);
+/* Direct pVM-to-pVM CPU page lease; the Host stage-2 stays unmapped. */
+int __pkvm_guest_export_page(struct pkvm_hyp_vcpu *owner_vcpu, u64 owner_ipa,
+			     struct pkvm_hyp_vm *receiver, u64 receiver_ipa,
+			     struct kvm_hyp_memcache *receiver_mc,
+			     phys_addr_t *phys);
+int __pkvm_guest_return_page(struct pkvm_hyp_vcpu *owner_vcpu, u64 owner_ipa,
+			     struct pkvm_hyp_vm *receiver, u64 receiver_ipa,
+			     phys_addr_t phys);
+bool __pkvm_inject_pvm_lease_abort(struct pkvm_hyp_vcpu *hyp_vcpu);
 int __pkvm_host_share_ffa(u64 pfn, u64 nr_pages);
 int __pkvm_host_unshare_ffa(u64 pfn, u64 nr_pages);
 int __pkvm_host_donate_guest(u64 pfn, u64 gfn, u64 nr_pages, struct pkvm_hyp_vcpu *vcpu);

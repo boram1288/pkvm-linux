@@ -4,6 +4,14 @@
 
 #include <nvhe/pkvm.h>
 
+#define KVM_PVM_DMA_SHARE_EXPORT	3
+#define KVM_PVM_DMA_SHARE_IMPORT	4
+#define KVM_PVM_DMA_SHARE_RETURN	5
+#define KVM_PVM_DMA_SHARE_REVOKE	6
+#define KVM_PVM_DMA_SHARE_LEASE_QUERY	7
+#define KVM_PVM_DMA_SHARE_EVENT_POLL	8
+#define KVM_PVM_DMA_SHARE_ID_GET	9
+
 bool pkvm_pvm_dma_share_hvc(struct pkvm_hyp_vcpu *hyp_vcpu,
 			    u64 *exit_code);
 void pkvm_pvm_dma_share_teardown(struct pkvm_hyp_vm *vm);
