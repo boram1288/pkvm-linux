@@ -1152,6 +1152,12 @@ int __pkvm_start_teardown_vm(pkvm_handle_t handle)
 	hyp_vm->is_dying = true;
 unlock:
 	hyp_write_unlock(&vm_table_lock);
+	if (!ret) {
+#ifdef CONFIG_PKVM_PVM_DMA_SHARE
+		/* Restore active peer leases before Host starts reclaiming pages. */
+		pkvm_pvm_dma_share_teardown(hyp_vm);
+#endif
+	}
 
 	return ret;
 }
@@ -2179,6 +2185,24 @@ u32 vm_handle_to_ffa_handle(pkvm_handle_t vm_handle)
 		return vm_handle_to_idx(vm_handle) + 1;
 }
 
+struct pkvm_hyp_vm *pkvm_get_hyp_vm_by_endpoint_id(u32 endpoint_id)
+{
+	struct pkvm_hyp_vm *hyp_vm = NULL;
+	pkvm_handle_t handle;
+
+	if (!endpoint_id || endpoint_id > KVM_MAX_PVMS)
+		return NULL;
+
+	handle = idx_to_vm_handle(endpoint_id - 1);
+	hyp_read_lock(&vm_table_lock);
+	hyp_vm = get_vm_by_handle(handle);
+	if (hyp_vm && hyp_vm->is_dying)
+		hyp_vm = NULL;
+	hyp_read_unlock(&vm_table_lock);
+
+	return hyp_vm;
+}
+
 u32 hyp_vcpu_to_ffa_handle(struct pkvm_hyp_vcpu *hyp_vcpu)
 {
 	pkvm_handle_t vm_handle;
@@ -2188,4 +2212,9 @@ u32 hyp_vcpu_to_ffa_handle(struct pkvm_hyp_vcpu *hyp_vcpu)
 
 	vm_handle = hyp_vcpu->vcpu.kvm->arch.pkvm.handle;
 	return vm_handle_to_ffa_handle(vm_handle);
+}
+
+u32 hyp_vcpu_to_endpoint_id(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	return hyp_vcpu_to_ffa_handle(hyp_vcpu);
 }

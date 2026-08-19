@@ -41,6 +41,7 @@ enum pkvm_page_state {
 	PKVM_PAGE_RESTRICTED_PROT	= BIT(4),
 	PKVM_MMIO			= BIT(5),
 	PKVM_ACCEPT_MODULE_OWNED	= BIT(6),
+	PKVM_PVM_LEASED			= BIT(7),
 };
 #define PKVM_PAGE_STATE_MASK		(BIT(0) | BIT(1))
 

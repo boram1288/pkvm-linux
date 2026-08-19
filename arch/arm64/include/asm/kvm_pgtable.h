@@ -308,6 +308,9 @@ enum kvm_pgtable_prot {
 /* Indicates a IPA range where MODULE_OWNED pages are accepted */
 #define KVM_ACCEPT_MODULE_PROT_NOTE	BIT(12)
 
+/* Indicates an owner IPA whose page is leased to another protected VM. */
+#define KVM_PVM_LEASE_PROT_NOTE		BIT(13)
+
 #define KVM_PGTABLE_PROT_RW	(KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W)
 #define KVM_PGTABLE_PROT_RWX	(KVM_PGTABLE_PROT_RW | KVM_PGTABLE_PROT_X)
 
