@@ -138,8 +138,16 @@ static void test_ffa(void)
 {
 	struct arm_smccc_res res;
 
+	/*
+	 * FF-A is only negotiated when a Secure Monitor (TF-A/OP-TEE) answers
+	 * FFA_VERSION, i.e. in the E-2 environment (see
+	 * test_vm_create_protected()). Plain E-1 QEMU has no Secure World, so
+	 * silently skip the rest of the FF-A checks instead of failing every
+	 * protected-VM test that shares this guest_code() path.
+	 */
 	smccc(FFA_VERSION, FFA_VERSION_1_2, &res);
-	GUEST_ASSERT_EQ(res.a0, FFA_VERSION_1_2);
+	if (res.a0 != FFA_VERSION_1_2)
+		return;
 
 	smccc(FFA_ID_GET, 0, &res);
 	GUEST_ASSERT_EQ(res.a0, FFA_SUCCESS);
@@ -578,7 +586,14 @@ static struct kvm_vm *test_vm_create_protected(struct kvm_vcpu **vcpu)
 
 	shape.type = VM_TYPE_PROTECTED;
 	vm = vm_create_shape_with_one_vcpu(shape, vcpu, NULL);
-	vm_ioctl(vm, KVM_ENABLE_CAP, &ffa_cap);
+	/*
+	 * FF-A is only negotiated when a Secure Monitor (TF-A/OP-TEE) answers
+	 * FFA_VERSION, i.e. in the E-2 environment. Plain E-1 QEMU has no
+	 * Secure World, so pkvm_vm_ioctl_ffa_support() returns -EINVAL. This
+	 * helper is shared by every protected-VM test, so treat FF-A as
+	 * best-effort instead of aborting VM creation when it is absent.
+	 */
+	__vm_ioctl(vm, KVM_ENABLE_CAP, &ffa_cap);
 
 	idmap_gpa = vm_compute_max_gfn(vcpu[0]->vm) * vm->page_size;
 	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS, idmap_gpa, 2, 1, 0);

@@ -1222,9 +1222,26 @@ static void do_ffa_mem_reclaim(struct arm_smccc_1_2_regs *res,
 			is_lend = entry->is_lend;
 
 			ffa_mem_reclaim(res, handle_lo, handle_hi, flags);
-			if (res->a0 != FFA_SUCCESS)
-				goto out_unlock;
-
+			/*
+			 * OP-TEE's SPMC can legitimately answer this reclaim
+			 * with an FFA_ERROR when it never called
+			 * mobj_ffa_get_by_cookie() on the corresponding
+			 * cookie, e.g. because a TEEC_RegisterSharedMemory()
+			 * retry (primary buffer, then shadow buffer) already
+			 * unregistered its own copy first. OP-TEE documents
+			 * that case as expected and harmless. Previously this
+			 * function bailed out here on any non-success
+			 * response, leaking the local `ranges` share (pages
+			 * stuck mapped as FFA_MEM_RW to the SPMD) and the
+			 * fixed-size spm_handles pool slot forever. After a
+			 * handful of such reclaims spm_handles was exhausted
+			 * and every subsequent FFA_MEM_SHARE from the host
+			 * failed with FFA_RET_NOT_SUPPORTED (or FFA_RET_DENIED
+			 * once a leaked page got re-shared). Always release
+			 * the host-local bookkeeping regardless of the SPMC's
+			 * answer; only the return value we hand back to the
+			 * host still reflects what the SPMC actually said.
+			 */
 			WARN_ON(ffa_host_unshare_ranges(entry->ranges,
 						entry->nranges, is_lend));
 			entry->nranges = 0;
@@ -1631,8 +1648,22 @@ static int kvm_host_ffa_signal_availability(void)
 		return ffa_to_linux_errno(ret);
 
 	do_ffa_part_get_response(&res, 0, 0, 0, 0, 0, NULL);
-	if (res.a0 != FFA_SUCCESS)
-		return ffa_to_linux_errno(ret);
+	if (res.a0 != FFA_SUCCESS) {
+		/*
+		 * Upstream bug: this used to return ffa_to_linux_errno(ret)
+		 * with the stale `ret` from ffa_map_hyp_buffers() (always 0
+		 * here), silently reporting success even when
+		 * do_ffa_part_get_response() failed. That left
+		 * has_host_signalled permanently true without OP-TEE ever
+		 * learning about the host guest via FFA_MSG_SEND_VM_CREATED,
+		 * so every later direct message got TEE_ERROR_ITEM_NOT_FOUND
+		 * instead of a real answer. Derive the error from the actual
+		 * response and let the caller retry.
+		 */
+		if (res.a0 == FFA_ERROR)
+			return ffa_to_linux_errno(res.a2);
+		return -EINVAL;
+	}
 
 	ffa_rx_release(&res);
 
@@ -1692,6 +1723,13 @@ bool kvm_host_ffa_handler(struct kvm_cpu_context *host_ctxt, u32 func_id)
 			write_sysreg_el2(read_sysreg_el2(SYS_ELR) - 4, SYS_ELR);
 			return true;
 		}
+		/*
+		 * Any other failure to signal availability (has_host_signalled
+		 * stays false) falls through to handle func_id anyway, matching
+		 * upstream's original best-effort behaviour: the Host FFA call
+		 * that triggered this still gets processed even if the SP was
+		 * never notified of the Host's availability.
+		 */
 	}
 
 	switch (func_id) {
