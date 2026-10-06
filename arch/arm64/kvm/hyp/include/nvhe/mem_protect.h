@@ -89,6 +89,8 @@ u64 __pkvm_ptdump_walk_range(pkvm_handle_t handle, struct pkvm_ptdump_log_hdr *l
 
 int hyp_check_range_owned(u64 addr, u64 size);
 int __pkvm_install_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn);
+int __pkvm_revoke_guest_mmio(struct pkvm_hyp_vm *vm, u64 ipa,
+			    u64 phys, u64 size);
 
 int pkvm_get_guest_pa_request(struct pkvm_hyp_vcpu *hyp_vcpu, u64 ipa,
 			      size_t ipa_size_request, u64 *out_pa, s8 *out_level);

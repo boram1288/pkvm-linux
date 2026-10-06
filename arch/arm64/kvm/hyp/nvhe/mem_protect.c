@@ -3163,6 +3163,43 @@ static int __pkvm_remove_ioguard_page(struct pkvm_hyp_vm *vm, u64 ipa)
 	return kvm_pte_valid(pte) ? -EEXIST : -EINVAL;
 }
 
+int __pkvm_revoke_guest_mmio(struct pkvm_hyp_vm *vm, u64 ipa,
+			    u64 phys, u64 size)
+{
+	u64 offset;
+	kvm_pte_t pte;
+	s8 level;
+	int ret;
+
+	if (!PAGE_ALIGNED(ipa) || !PAGE_ALIGNED(phys) || !PAGE_ALIGNED(size))
+		return -EINVAL;
+	host_lock_component();
+	guest_lock_component(vm);
+	/* The camera has one identity-mapped window. Validate before unmapping. */
+	for (offset = 0; offset < size; offset += PAGE_SIZE) {
+		ret = kvm_pgtable_get_leaf(&vm->pgt, ipa + offset, &pte, &level);
+		if (ret)
+			goto out;
+		if (kvm_pte_valid(pte) &&
+		    (kvm_granule_size(level) != PAGE_SIZE ||
+		     kvm_pte_to_phys(pte) != phys + offset)) {
+			ret = -EPERM;
+			goto out;
+		}
+	}
+	ret = kvm_pgtable_stage2_unmap(&vm->pgt, ipa, size);
+	if (!ret) {
+		/* Guest-owned MMIO is already absent from the Host IOMMU idmap.
+		 * Only change the CPU stage-2 ownership annotation here. */
+		ret = __host_stage2_set_owner_locked(phys, size, PKVM_ID_HYP, 0,
+				HOST_SET_IS_MMIO | HOST_SET_NO_IOMMU_UPDATE);
+	}
+out:
+	guest_unlock_component(vm);
+	host_unlock_component();
+	return ret;
+}
+
 int __pkvm_install_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn)
 {
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
@@ -3171,9 +3208,13 @@ int __pkvm_install_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn)
 
 	hyp_lock_component();
 	guest_lock_component(vm);
-	ret = __pkvm_remove_ioguard_page(vm, ipa);
-	if (ret)
-		goto out_unlock;
+	/* Direct-boot VMs may not enroll in the optional emulated-MMIO guard.
+	 * Device ownership was already authenticated by the assignment path. */
+	if (test_bit(KVM_ARCH_FLAG_MMIO_GUARD, &vm->kvm.arch.flags)) {
+		ret = __pkvm_remove_ioguard_page(vm, ipa);
+		if (ret)
+			goto out_unlock;
+	}
 	ret = pkvm_hyp_donate_guest(hyp_vcpu, pfn, gfn);
 out_unlock:
 	guest_unlock_component(vm);

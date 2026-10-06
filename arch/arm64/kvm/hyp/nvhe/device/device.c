@@ -38,6 +38,18 @@ static void pkvm_device_unmap_hyp_resource(u64 phys, u64 size)
  */
 static DEFINE_HYP_SPINLOCK(device_spinlock);
 
+#define PKVM_CAMERA_BASE 0x0b000000UL
+#define PKVM_CAMERA_SIZE 0x4000UL
+#define PKVM_CAMERA_QUERY 0
+#define PKVM_CAMERA_RELEASE 1
+
+static bool is_camera(struct pkvm_device *dev)
+{
+	return dev->nr_resources == 1 &&
+		dev->resources[0].base == PKVM_CAMERA_BASE &&
+		dev->resources[0].size == PKVM_CAMERA_SIZE;
+}
+
 #ifdef CONFIG_PKVM_QEMU_EDU
 #define PKVM_QEMU_EDU_BASE		0x10000000UL
 #define PKVM_QEMU_EDU_SIZE		0x100000UL
@@ -62,6 +74,51 @@ static struct pkvm_device_ops pkvm_qemu_edu_ops = {
 	.reset = pkvm_qemu_edu_reset,
 };
 
+static int pkvm_qemu_camera_reset(void *cookie, bool host_to_guest)
+{
+	void *base = hyp_fixmap_map(PKVM_CAMERA_BASE);
+	u32 cap, cmd, status;
+	unsigned int i;
+	int ret = -ETIMEDOUT;
+
+	asm volatile("ldr %w0, [%1]" : "=r" (cap) : "r" (base));
+	if ((cap & 0xff) != 0x40) {
+		ret = -ENODEV;
+		goto out;
+	}
+	/* Stop DMA before resetting transfer/event rings. */
+	asm volatile("ldr %w0, [%1]" : "=r" (cmd) : "r" (base + 0x40));
+	cmd &= ~BIT(0);
+	asm volatile("str %w0, [%1]" : : "r" (cmd), "r" (base + 0x40));
+	dsb(sy);
+	for (i = 0; i < 10000; i++) {
+		asm volatile("ldr %w0, [%1]" : "=r" (status) : "r" (base + 0x44));
+		if (status & BIT(0))
+			break;
+	}
+	if (i == 10000)
+		goto out;
+	/* Reset the halted controller, including transfer/event rings. */
+	cmd = BIT(1);
+	asm volatile("str %w0, [%1]" : : "r" (cmd), "r" (base + 0x40));
+	dsb(sy);
+	for (i = 0; i < 10000; i++) {
+		asm volatile("ldr %w0, [%1]" : "=r" (cmd) : "r" (base + 0x40));
+		asm volatile("ldr %w0, [%1]" : "=r" (status) : "r" (base + 0x44));
+		if (!(cmd & BIT(1)) && !(status & BIT(11)) && (status & BIT(0))) {
+			ret = 0;
+			break;
+		}
+	}
+out:
+	hyp_fixmap_unmap();
+	return ret;
+}
+
+static struct pkvm_device_ops pkvm_qemu_camera_ops = {
+	.reset = pkvm_qemu_camera_reset,
+};
+
 static int pkvm_qemu_edu_init(void)
 {
 	int i, ret;
@@ -73,6 +130,11 @@ static int pkvm_qemu_edu_init(void)
 					       (void *)base);
 		if (ret)
 			return ret;
+	}
+	for (i = 0; i < registered_devices_nr; i++) {
+		if (is_camera(&registered_devices[i]))
+			return pkvm_device_register_ops(PKVM_CAMERA_BASE,
+						&pkvm_qemu_camera_ops, NULL);
 	}
 	return 0;
 }
@@ -172,7 +234,7 @@ int pkvm_device_hyp_assign_mmio(u64 pfn, u64 nr_pages)
 
 	hyp_spin_lock(&device_spinlock);
 	/* A VM already have this device, no take backs. */
-	if (dev->ctxt || dev->refcount || dev->hyp_owned) {
+	if (dev->ctxt || dev->refcount || dev->hyp_owned || dev->quarantined) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
@@ -221,7 +283,7 @@ int pkvm_device_reclaim_mmio(u64 pfn, u64 nr_pages)
 		return -ENODEV;
 
 	hyp_spin_lock(&device_spinlock);
-	if (dev->ctxt) {
+	if (dev->ctxt || dev->quarantined) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
@@ -292,6 +354,8 @@ static int __pkvm_device_assign(struct pkvm_device *dev, struct pkvm_hyp_vm *vm)
 	int ret;
 
 	hyp_assert_lock_held(&device_spinlock);
+	if (dev->quarantined)
+		return -EIO;
 
 	for (i = 0 ; i < dev->nr_resources; ++i) {
 		res = &dev->resources[i];
@@ -307,10 +371,15 @@ static int __pkvm_device_assign(struct pkvm_device *dev, struct pkvm_hyp_vm *vm)
 	}
 
 	ret = pkvm_device_reset(dev, true);
-	if (ret)
+	if (ret) {
+		if (is_camera(dev))
+			dev->quarantined = true;
 		return ret;
+	}
 
 	dev->ctxt = vm;
+	if (is_camera(dev))
+		dev->lease_epoch++;
 	return 0;
 }
 
@@ -360,8 +429,15 @@ int pkvm_host_map_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn)
 
 	if (!dev)
 		return -ENODEV;
+	/* A fixed IPA prevents hidden aliases surviving a live release. */
+	if (is_camera(dev) && pfn != gfn)
+		return -EINVAL;
 
 	hyp_spin_lock(&device_spinlock);
+	if (dev->quarantined) {
+		ret = -EIO;
+		goto out_ret;
+	}
 
 	if (dev->ctxt == NULL) {
 		/*
@@ -445,9 +521,9 @@ out_inval:
 	return true;
 }
 
-static void pkvm_devices_reclaim_device(struct pkvm_device *dev)
+static int pkvm_devices_reclaim_device(struct pkvm_device *dev)
 {
-	int i;
+	int i, ret;
 
 	for (i = 0 ; i < dev->nr_resources ; ++i) {
 		struct pkvm_dev_resource *res = &dev->resources[i];
@@ -462,11 +538,92 @@ static void pkvm_devices_reclaim_device(struct pkvm_device *dev)
 		 * stage-2 immediately after this device teardown.
 		 */
 		pkvm_device_unmap_hyp_resource(res->base, res->size);
-		WARN_ON(host_stage2_set_owner_locked(res->base, res->size, PKVM_ID_HOST));
+		ret = host_stage2_set_owner_locked(res->base, res->size, PKVM_ID_HOST);
 		hyp_spin_unlock(&pkvm_pgd_lock);
 		hyp_spin_unlock(&host_mmu.lock);
+		if (ret)
+			return ret;
 	}
 	dev->hyp_owned = false;
+	return 0;
+}
+
+long pkvm_camera_host_query(void)
+{
+	struct pkvm_device *dev = pkvm_get_device(PKVM_CAMERA_BASE, PKVM_CAMERA_SIZE);
+	long state;
+
+	if (!dev)
+		return -ENODEV;
+	hyp_spin_lock(&device_spinlock);
+	state = dev->quarantined ? 4 : dev->ctxt ? 2 : dev->hyp_owned ? 3 : 1;
+	state |= dev->lease_epoch << 3;
+	hyp_spin_unlock(&device_spinlock);
+	return state;
+}
+
+bool pkvm_camera_hvc(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+	struct pkvm_device *dev = pkvm_get_device(PKVM_CAMERA_BASE, PKVM_CAMERA_SIZE);
+	u64 op = smccc_get_arg1(vcpu), epoch = smccc_get_arg2(vcpu), state = 0;
+	int ret = -ENODEV;
+
+	if (!dev)
+		goto done;
+	hyp_spin_lock(&device_spinlock);
+	state = dev->quarantined ? 4 : dev->ctxt ? 2 : dev->hyp_owned ? 3 : 1;
+	if (smccc_get_arg3(vcpu) || smccc_get_arg4(vcpu) ||
+	    smccc_get_arg5(vcpu) || smccc_get_arg6(vcpu)) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (op == PKVM_CAMERA_QUERY) {
+		ret = 0;
+		goto unlock;
+	}
+	if (op != PKVM_CAMERA_RELEASE) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (dev->ctxt != vm) {
+		ret = -EPERM;
+		goto unlock;
+	}
+	if (epoch != dev->lease_epoch) {
+		ret = -ESTALE;
+		goto unlock;
+	}
+	/* The guest must detach its IOMMU before relinquishing the controller. */
+	if (dev->refcount || dev->quarantined) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	dev->quarantined = true;
+	state = 4;
+	ret = __pkvm_revoke_guest_mmio(vm, PKVM_CAMERA_BASE,
+				     PKVM_CAMERA_BASE, PKVM_CAMERA_SIZE);
+	if (ret)
+		goto unlock;
+	dev->hyp_owned = true;
+	ret = pkvm_device_reset(dev, false);
+	if (ret)
+		goto unlock;
+	ret = pkvm_devices_reclaim_device(dev);
+	if (ret)
+		goto unlock;
+	dev->ctxt = NULL;
+	dev->quarantined = false;
+	dev->lease_epoch++;
+	state = 1;
+unlock:
+	smccc_set_retval(vcpu, ret, dev->lease_epoch, state, 0);
+	hyp_spin_unlock(&device_spinlock);
+	return true;
+done:
+	smccc_set_retval(vcpu, ret, 0, 0, 0);
+	return true;
 }
 
 void pkvm_devices_teardown(struct pkvm_hyp_vm *vm)
@@ -479,11 +636,16 @@ void pkvm_devices_teardown(struct pkvm_hyp_vm *vm)
 
 		if (dev->ctxt != vm)
 			continue;
-		WARN_ON(pkvm_device_reset(dev, false));
+		if (WARN_ON(pkvm_device_reset(dev, false)) && is_camera(dev)) {
+			dev->quarantined = true;
+			dev->ctxt = NULL;
+			continue;
+		}
 		if (dev->ops && dev->ops->power_lock)
 			WARN_ON(pkvm_device_power_lock(vm, dev, false));
 		dev->ctxt = NULL;
-		pkvm_devices_reclaim_device(dev);
+		if (WARN_ON(pkvm_devices_reclaim_device(dev)) && is_camera(dev))
+			dev->quarantined = true;
 	}
 	hyp_spin_unlock(&device_spinlock);
 }
@@ -515,7 +677,7 @@ int pkvm_devices_get_context(u64 iommu_id, u32 endpoint_id, struct pkvm_hyp_vm *
 		return 0;
 
 	hyp_spin_lock(&device_spinlock);
-	if (dev->ctxt != vm)
+	if (dev->quarantined || dev->ctxt != vm)
 		ret = -EPERM;
 	else
 		hyp_refcount_inc(dev->refcount);
@@ -589,7 +751,9 @@ bool pkvm_device_request_dma(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code)
 		goto out_ret;
 
 	hyp_spin_lock(&device_spinlock);
-	if (dev->ctxt == NULL) {
+	if (dev->quarantined) {
+		ret = -EIO;
+	} else if (dev->ctxt == NULL) {
 		/*
 		 * First time device is assigned to guest, make sure it's resources
 		 * have been donated.

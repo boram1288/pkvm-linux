@@ -1902,6 +1902,11 @@ static void handle___pkvm_host_hvc_pd(struct kvm_cpu_context *host_ctxt)
 	cpu_reg(host_ctxt, 1) = pkvm_host_hvc_pd(device_id, on);
 }
 
+static void handle___pkvm_camera_host_query(struct kvm_cpu_context *host_ctxt)
+{
+	cpu_reg(host_ctxt, 1) = pkvm_camera_host_query();
+}
+
 static void handle___pkvm_host_donate_hyp_mmio(struct kvm_cpu_context *host_ctxt)
 {
 	DECLARE_REG(u64, pfn, host_ctxt, 1);
@@ -2058,6 +2063,7 @@ static const hcall_t host_hcall[] = {
 	HANDLE_FUNC(__pkvm_host_donate_hyp_mmio),
 	HANDLE_FUNC(__pkvm_host_reclaim_hyp_mmio),
 	HANDLE_FUNC(__pkvm_host_map_guest_mmio),
+	HANDLE_FUNC(__pkvm_camera_host_query),
 	HANDLE_FUNC(__pkvm_pviommu_attach),
 	HANDLE_FUNC(__pkvm_pviommu_add_vsid),
 };

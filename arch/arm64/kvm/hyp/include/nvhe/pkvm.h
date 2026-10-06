@@ -223,4 +223,6 @@ int pkvm_device_hyp_assign_mmio(u64 pfn, u64 nr_pages);
 int pkvm_device_reclaim_mmio(u64 pfn, u64 nr_pages);
 int pkvm_host_map_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn);
 int pkvm_device_register_ops(u64 phys, struct pkvm_device_ops *ops, void *cookie);
+long pkvm_camera_host_query(void);
+bool pkvm_camera_hvc(struct pkvm_hyp_vcpu *hyp_vcpu);
 #endif /* __ARM64_KVM_NVHE_PKVM_H__ */
