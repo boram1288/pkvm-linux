@@ -1773,7 +1773,10 @@ static int __pkvm_pin_user_pages(struct kvm *kvm, struct kvm_memory_slot *memslo
 	 * prevent try_to_unmap() from succeeding.
 	 */
 	for (p = 0; p < nr_pages; p++) {
-		if (!folio_test_swapbacked(page_folio(pages[p]))) {
+		/* Private COW HugeTLB pages have no file writeback/rmap dependency. */
+		if (!folio_test_swapbacked(page_folio(pages[p])) &&
+		    !(folio_test_hugetlb(page_folio(pages[p])) &&
+		      folio_test_anon(page_folio(pages[p])))) {
 			ret = -EIO;
 			goto err_unpin_pages;
 		}

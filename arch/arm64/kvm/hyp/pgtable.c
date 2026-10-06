@@ -921,7 +921,7 @@ static bool stage2_leaf_mapping_allowed(const struct kvm_pgtable_visit_ctx *ctx,
 		return false;
 
 	if (data->annotation)
-		return true;
+		return kvm_block_mapping_supported(ctx, ctx->addr);
 
 	return kvm_block_mapping_supported(ctx, phys);
 }
@@ -1226,14 +1226,14 @@ int kvm_pgtable_stage2_map(struct kvm_pgtable *pgt, u64 addr, u64 size,
 	return ret;
 }
 
-int kvm_pgtable_stage2_annotate(struct kvm_pgtable *pgt, u64 addr, u64 size,
-				void *mc, kvm_pte_t pte_annot)
+int kvm_pgtable_stage2_annotate_granule(struct kvm_pgtable *pgt, u64 addr, u64 size,
+				void *mc, kvm_pte_t pte_annot, u64 granule)
 {
 	int ret;
 	struct stage2_map_data map_data = {
 		.mmu		= pgt->mmu,
 		.memcache	= mc,
-		.force_pte	= true,
+		.force_pte	= granule == PAGE_SIZE,
 		.annotation	= true,
 		.pte_annot	= pte_annot,
 	};
@@ -1244,11 +1244,20 @@ int kvm_pgtable_stage2_annotate(struct kvm_pgtable *pgt, u64 addr, u64 size,
 		.arg		= &map_data,
 	};
 
-	if (pte_annot & PTE_VALID)
+	if ((granule != PAGE_SIZE && granule != PMD_SIZE) ||
+	    !IS_ALIGNED(addr, granule) || !IS_ALIGNED(size, granule) ||
+	    (pte_annot & PTE_VALID))
 		return -EINVAL;
 
 	ret = kvm_pgtable_walk(pgt, addr, size, &walker);
 	return ret;
+}
+
+int kvm_pgtable_stage2_annotate(struct kvm_pgtable *pgt, u64 addr, u64 size,
+				void *mc, kvm_pte_t pte_annot)
+{
+	return kvm_pgtable_stage2_annotate_granule(pgt, addr, size, mc,
+						 pte_annot, PAGE_SIZE);
 }
 
 static int stage2_unmap_walker(const struct kvm_pgtable_visit_ctx *ctx,

@@ -721,6 +721,9 @@ int kvm_pgtable_stage2_map(struct kvm_pgtable *pgt, u64 addr, u64 size,
  *
  * Return: 0 on success, negative error code on failure.
  */
+/* Annotate aligned page or PMD leases without forcing PMDs into PTE tables. */
+int kvm_pgtable_stage2_annotate_granule(struct kvm_pgtable *pgt, u64 addr, u64 size,
+				void *mc, kvm_pte_t pte_annot, u64 granule);
 int kvm_pgtable_stage2_annotate(struct kvm_pgtable *pgt, u64 addr, u64 size,
 				void *mc, kvm_pte_t annotation);
 

@@ -52,6 +52,7 @@ struct pvm_cpu_lease {
 	struct pkvm_hyp_vm *receiver;
 	phys_addr_t pages[PVM_CPU_LEASE_MAX_PAGES];
 	u64 size;
+	u64 granule;
 	u32 mapped_pages;
 	u64 export_ticks;
 	u64 import_ticks;
@@ -369,10 +370,10 @@ static int pvm_cpu_lease_restore(void)
 	while (pvm_cpu_lease.mapped_pages) {
 		i = pvm_cpu_lease.mapped_pages - 1;
 		ret = __pkvm_guest_return_page(pvm_cpu_lease.owner_vcpu,
-			pvm_cpu_lease.owner_ipa + i * PAGE_SIZE,
+			pvm_cpu_lease.owner_ipa + i * pvm_cpu_lease.granule,
 			pvm_cpu_lease.receiver,
-			pvm_cpu_lease.receiver_ipa + i * PAGE_SIZE,
-			pvm_cpu_lease.pages[i]);
+			pvm_cpu_lease.receiver_ipa + i * pvm_cpu_lease.granule,
+			pvm_cpu_lease.pages[i], pvm_cpu_lease.granule);
 		if (ret)
 			return ret;
 		pvm_cpu_lease.mapped_pages--;
@@ -536,7 +537,9 @@ static bool pvm_cpu_lease_export(struct pkvm_hyp_vcpu *hyp_vcpu,
 	u64 owner_ipa = smccc_get_arg2(vcpu);
 	u64 receiver_endpoint = smccc_get_arg3(vcpu);
 	u64 size = smccc_get_arg4(vcpu);
-	u64 pa;
+	u64 pa, first_pa = 0;
+	u64 block = smccc_get_arg5(vcpu);
+	u64 granule = block ? PMD_SIZE : PAGE_SIZE;
 	s8 level;
 	struct pkvm_hyp_vm *receiver;
 	int ret;
@@ -546,7 +549,8 @@ static bool pvm_cpu_lease_export(struct pkvm_hyp_vcpu *hyp_vcpu,
 	    owner_ipa + PAGE_ALIGN(size) < owner_ipa ||
 	    !receiver_endpoint ||
 	    receiver_endpoint == hyp_vcpu_to_endpoint_id(hyp_vcpu) ||
-	    smccc_get_arg5(vcpu) || smccc_get_arg6(vcpu))
+	    block > 1 || smccc_get_arg6(vcpu) ||
+	    !IS_ALIGNED(owner_ipa, granule) || !IS_ALIGNED(size, granule))
 		goto invalid;
 
 	hyp_spin_lock(&pvm_dma_share_lock);
@@ -564,6 +568,14 @@ static bool pvm_cpu_lease_export(struct pkvm_hyp_vcpu *hyp_vcpu,
 		}
 		if (ret)
 			goto invalid;
+		if (block) {
+			if (!offset)
+				first_pa = pa;
+			if (kvm_granule_size(level) != PMD_SIZE ||
+			    !IS_ALIGNED(first_pa, PMD_SIZE) || pa != first_pa + offset)
+				goto invalid;
+			continue;
+		}
 		if (kvm_granule_size(level) != PAGE_SIZE) {
 			int cache_ready;
 
@@ -606,6 +618,7 @@ static bool pvm_cpu_lease_export(struct pkvm_hyp_vcpu *hyp_vcpu,
 	pvm_cpu_lease.owner = vm;
 	pvm_cpu_lease.receiver = receiver;
 	pvm_cpu_lease.size = size;
+	pvm_cpu_lease.granule = granule;
 	pvm_cpu_lease.owner_ipa = owner_ipa;
 	pvm_cpu_lease.receiver_endpoint = receiver_endpoint;
 	pvm_cpu_lease.token = ++pvm_cpu_next_token;
@@ -645,14 +658,15 @@ static bool pvm_cpu_lease_import(struct pkvm_hyp_vcpu *hyp_vcpu,
 		hyp_spin_unlock(&pvm_dma_share_lock);
 		goto invalid;
 	}
-	if (receiver_ipa + PAGE_ALIGN(pvm_cpu_lease.size) < receiver_ipa ||
+	if (!IS_ALIGNED(receiver_ipa, pvm_cpu_lease.granule) ||
+	    receiver_ipa + PAGE_ALIGN(pvm_cpu_lease.size) < receiver_ipa ||
 	    (pvm_cpu_lease.mapped_pages &&
 	     pvm_cpu_lease.receiver_ipa != receiver_ipa)) {
 		hyp_spin_unlock(&pvm_dma_share_lock);
 		goto invalid;
 	}
 	pvm_cpu_lease.receiver_ipa = receiver_ipa;
-	while (pvm_cpu_lease.mapped_pages < DIV_ROUND_UP(pvm_cpu_lease.size, PAGE_SIZE)) {
+	while (pvm_cpu_lease.mapped_pages < DIV_ROUND_UP(pvm_cpu_lease.size, pvm_cpu_lease.granule)) {
 		u32 i = pvm_cpu_lease.mapped_pages;
 
 		cache_ready = pvm_cpu_lease_memcache_ready(hyp_vcpu, exit_code);
@@ -663,8 +677,8 @@ static bool pvm_cpu_lease_import(struct pkvm_hyp_vcpu *hyp_vcpu,
 		if (cache_ready < 0)
 			goto rollback;
 		ret = __pkvm_guest_export_page(pvm_cpu_lease.owner_vcpu,
-			pvm_cpu_lease.owner_ipa + i * PAGE_SIZE, vm,
-			receiver_ipa + i * PAGE_SIZE, &vcpu->arch.stage2_mc, &pa);
+			pvm_cpu_lease.owner_ipa + i * pvm_cpu_lease.granule, vm,
+			receiver_ipa + i * pvm_cpu_lease.granule, &vcpu->arch.stage2_mc, &pa, pvm_cpu_lease.granule);
 		if (ret)
 			goto rollback;
 		pvm_cpu_lease.pages[i] = pa;
@@ -672,7 +686,8 @@ static bool pvm_cpu_lease_import(struct pkvm_hyp_vcpu *hyp_vcpu,
 	}
 	pvm_cpu_lease.mapped = true;
 	pvm_cpu_lease.import_ticks = pvm_cpu_clock();
-	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, pvm_cpu_lease.size, 0, 0);
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, pvm_cpu_lease.size,
+			 pvm_cpu_lease.granule, pvm_cpu_lease.mapped_pages);
 	hyp_spin_unlock(&pvm_dma_share_lock);
 	return true;
 

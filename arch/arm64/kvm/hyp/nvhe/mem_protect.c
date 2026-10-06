@@ -1634,7 +1634,7 @@ static void guest_unlock_two_components(struct pkvm_hyp_vm *first,
 int __pkvm_guest_export_page(struct pkvm_hyp_vcpu *owner_vcpu, u64 owner_ipa,
 			     struct pkvm_hyp_vm *receiver, u64 receiver_ipa,
 			     struct kvm_hyp_memcache *receiver_mc,
-			     phys_addr_t *phys)
+			     phys_addr_t *phys, u64 granule)
 {
 	struct pkvm_hyp_vm *owner = pkvm_hyp_vcpu_to_hyp_vm(owner_vcpu);
 	kvm_pte_t owner_pte, receiver_pte;
@@ -1642,40 +1642,45 @@ int __pkvm_guest_export_page(struct pkvm_hyp_vcpu *owner_vcpu, u64 owner_ipa,
 	phys_addr_t pa;
 	int ret;
 
-	if (!receiver || receiver == owner || !PAGE_ALIGNED(owner_ipa) ||
-	    !PAGE_ALIGNED(receiver_ipa) || !phys || !receiver_mc)
+	if (!receiver || receiver == owner || (granule != PAGE_SIZE && granule != PMD_SIZE) || !IS_ALIGNED(owner_ipa, granule) ||
+	    !IS_ALIGNED(receiver_ipa, granule) || !phys || !receiver_mc)
 		return -EINVAL;
 
 	host_lock_component();
 	guest_lock_two_components(owner, receiver);
 	ret = kvm_pgtable_get_leaf(&owner->pgt, owner_ipa, &owner_pte, &owner_level);
 	if (ret || !kvm_pte_valid(owner_pte) ||
-	    kvm_granule_size(owner_level) != PAGE_SIZE ||
+	    kvm_granule_size(owner_level) != granule ||
 	    (guest_get_page_state(owner_pte, owner_ipa) & ~PKVM_PAGE_RESTRICTED_PROT) != PKVM_PAGE_OWNED) {
 		ret = -EPERM;
 		goto unlock;
 	}
 
 	pa = kvm_pte_to_phys(owner_pte);
-	ret = __host_check_page_state_range(pa, PAGE_SIZE, PKVM_NOPAGE);
+	if (!IS_ALIGNED(pa, granule)) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	ret = __host_check_page_state_range(pa, granule, PKVM_NOPAGE);
 	if (ret)
 		goto unlock;
 
 	ret = kvm_pgtable_get_leaf(&receiver->pgt, receiver_ipa,
 				   &receiver_pte, &receiver_level);
-	if (!ret && kvm_pte_valid(receiver_pte)) {
+	if (ret || kvm_pte_valid(receiver_pte) ||
+	    kvm_granule_size(receiver_level) < granule) {
 		ret = -EEXIST;
 		goto unlock;
 	}
 
 	current_vm = owner;
-	ret = kvm_pgtable_stage2_unmap(&owner->pgt, owner_ipa, PAGE_SIZE);
+	ret = kvm_pgtable_stage2_unmap(&owner->pgt, owner_ipa, granule);
 	if (ret)
 		goto unlock;
-	ret = kvm_pgtable_stage2_annotate(&owner->pgt, owner_ipa, PAGE_SIZE,
-					  receiver_mc, KVM_PVM_LEASE_PROT_NOTE);
+	ret = kvm_pgtable_stage2_annotate_granule(&owner->pgt, owner_ipa, granule,
+					  receiver_mc, KVM_PVM_LEASE_PROT_NOTE, granule);
 	if (ret) {
-		WARN_ON(kvm_pgtable_stage2_map(&owner->pgt, owner_ipa, PAGE_SIZE, pa,
+		WARN_ON(kvm_pgtable_stage2_map(&owner->pgt, owner_ipa, granule, pa,
 					       pkvm_mkstate(KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W,
 							     PKVM_PAGE_OWNED),
 					       receiver_mc, 0));
@@ -1683,7 +1688,7 @@ int __pkvm_guest_export_page(struct pkvm_hyp_vcpu *owner_vcpu, u64 owner_ipa,
 	}
 
 	current_vm = receiver;
-	ret = kvm_pgtable_stage2_map(&receiver->pgt, receiver_ipa, PAGE_SIZE, pa,
+	ret = kvm_pgtable_stage2_map(&receiver->pgt, receiver_ipa, granule, pa,
 				     pkvm_mkstate(KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W,
 						   PKVM_PAGE_SHARED_BORROWED),
 				     receiver_mc, 0);
@@ -1691,8 +1696,8 @@ int __pkvm_guest_export_page(struct pkvm_hyp_vcpu *owner_vcpu, u64 owner_ipa,
 		/* Restore the owner mapping before exposing the failure. */
 		current_vm = owner;
 		WARN_ON(kvm_pgtable_stage2_unmap(&owner->pgt, owner_ipa,
-						 PAGE_SIZE));
-		WARN_ON(kvm_pgtable_stage2_map(&owner->pgt, owner_ipa, PAGE_SIZE, pa,
+						 granule));
+		WARN_ON(kvm_pgtable_stage2_map(&owner->pgt, owner_ipa, granule, pa,
 					       pkvm_mkstate(KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W,
 							     PKVM_PAGE_OWNED),
 					       receiver_mc, 0));
@@ -1709,15 +1714,15 @@ unlock:
 
 int __pkvm_guest_return_page(struct pkvm_hyp_vcpu *owner_vcpu, u64 owner_ipa,
 			     struct pkvm_hyp_vm *receiver, u64 receiver_ipa,
-			     phys_addr_t phys)
+			     phys_addr_t phys, u64 granule)
 {
 	struct pkvm_hyp_vm *owner = pkvm_hyp_vcpu_to_hyp_vm(owner_vcpu);
 	kvm_pte_t owner_pte, pte;
 	s8 level;
 	int ret;
 
-	if (!receiver || receiver == owner || !PAGE_ALIGNED(owner_ipa) ||
-	    !PAGE_ALIGNED(receiver_ipa))
+	if (!receiver || receiver == owner || (granule != PAGE_SIZE && granule != PMD_SIZE) || !IS_ALIGNED(owner_ipa, granule) ||
+	    !IS_ALIGNED(receiver_ipa, granule))
 		return -EINVAL;
 
 	host_lock_component();
@@ -1728,44 +1733,44 @@ int __pkvm_guest_return_page(struct pkvm_hyp_vcpu *owner_vcpu, u64 owner_ipa,
 		goto unlock;
 	}
 	ret = kvm_pgtable_get_leaf(&receiver->pgt, receiver_ipa, &pte, &level);
-	if (ret || !kvm_pte_valid(pte) || kvm_granule_size(level) != PAGE_SIZE ||
+	if (ret || !kvm_pte_valid(pte) || kvm_granule_size(level) != granule ||
 	    kvm_pte_to_phys(pte) != phys ||
 	    (guest_get_page_state(pte, receiver_ipa) & ~PKVM_PAGE_RESTRICTED_PROT) != PKVM_PAGE_SHARED_BORROWED) {
 		ret = -EPERM;
 		goto unlock;
 	}
 
-	ret = __host_check_page_state_range(phys, PAGE_SIZE, PKVM_NOPAGE);
+	ret = __host_check_page_state_range(phys, granule, PKVM_NOPAGE);
 	if (ret)
 		goto unlock;
 
 	current_vm = receiver;
-	ret = kvm_pgtable_stage2_unmap(&receiver->pgt, receiver_ipa, PAGE_SIZE);
+	ret = kvm_pgtable_stage2_unmap(&receiver->pgt, receiver_ipa, granule);
 	if (ret)
 		goto unlock;
 
 	current_vm = owner;
-	ret = kvm_pgtable_stage2_unmap(&owner->pgt, owner_ipa, PAGE_SIZE);
+	ret = kvm_pgtable_stage2_unmap(&owner->pgt, owner_ipa, granule);
 	if (ret) {
 		current_vm = receiver;
 		WARN_ON(kvm_pgtable_stage2_map(&receiver->pgt, receiver_ipa,
-					       PAGE_SIZE, phys,
+					       granule, phys,
 					       pkvm_mkstate(KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W,
 							     PKVM_PAGE_SHARED_BORROWED),
 					       &owner_vcpu->vcpu.arch.stage2_mc, 0));
 		goto unlock;
 	}
-	ret = kvm_pgtable_stage2_map(&owner->pgt, owner_ipa, PAGE_SIZE, phys,
+	ret = kvm_pgtable_stage2_map(&owner->pgt, owner_ipa, granule, phys,
 				     pkvm_mkstate(KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W,
 						   PKVM_PAGE_OWNED),
 				     &owner_vcpu->vcpu.arch.stage2_mc, 0);
 	if (ret) {
-		WARN_ON(kvm_pgtable_stage2_annotate(&owner->pgt, owner_ipa,
-						  PAGE_SIZE,
+		WARN_ON(kvm_pgtable_stage2_annotate_granule(&owner->pgt, owner_ipa,
+						  granule,
 						  &owner_vcpu->vcpu.arch.stage2_mc,
-						  KVM_PVM_LEASE_PROT_NOTE));
+						  KVM_PVM_LEASE_PROT_NOTE, granule));
 		current_vm = receiver;
-		WARN_ON(kvm_pgtable_stage2_map(&receiver->pgt, receiver_ipa, PAGE_SIZE,
+		WARN_ON(kvm_pgtable_stage2_map(&receiver->pgt, receiver_ipa, granule,
 					       phys, pkvm_mkstate(KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W,
 								    PKVM_PAGE_SHARED_BORROWED),
 					       &owner_vcpu->vcpu.arch.stage2_mc, 0));
@@ -1795,7 +1800,7 @@ bool __pkvm_inject_pvm_lease_abort(struct pkvm_hyp_vcpu *hyp_vcpu)
 	guest_lock_component(vm);
 	ret = kvm_pgtable_get_leaf(&vm->pgt, ipa, &pte, &level);
 	guest_unlock_component(vm);
-	if (ret || kvm_granule_size(level) != PAGE_SIZE ||
+	if (ret || (kvm_granule_size(level) != PAGE_SIZE && kvm_granule_size(level) != PMD_SIZE) ||
 	    pte != KVM_PVM_LEASE_PROT_NOTE)
 		return false;
 

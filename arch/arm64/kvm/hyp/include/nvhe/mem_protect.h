@@ -57,10 +57,10 @@ int __pkvm_guest_unshare_ffa_page(struct pkvm_hyp_vcpu *vcpu, u64 ipa);
 int __pkvm_guest_export_page(struct pkvm_hyp_vcpu *owner_vcpu, u64 owner_ipa,
 			     struct pkvm_hyp_vm *receiver, u64 receiver_ipa,
 			     struct kvm_hyp_memcache *receiver_mc,
-			     phys_addr_t *phys);
+			     phys_addr_t *phys, u64 granule);
 int __pkvm_guest_return_page(struct pkvm_hyp_vcpu *owner_vcpu, u64 owner_ipa,
 			     struct pkvm_hyp_vm *receiver, u64 receiver_ipa,
-			     phys_addr_t phys);
+			     phys_addr_t phys, u64 granule);
 bool __pkvm_inject_pvm_lease_abort(struct pkvm_hyp_vcpu *hyp_vcpu);
 int __pkvm_host_share_ffa(u64 pfn, u64 nr_pages);
 int __pkvm_host_unshare_ffa(u64 pfn, u64 nr_pages);
