@@ -60,6 +60,7 @@ struct pvm_cpu_lease {
 	u64 receiver_ipa;
 	u64 token;
 	u32 receiver_endpoint;
+	bool acknowledged;
 	bool event_pending;
 	bool mapped;
 };
@@ -72,6 +73,7 @@ static struct {
 	struct pkvm_hyp_vcpu *owner_vcpu;
 	u64 token;
 	u64 forward_ticks;
+	u64 receiver_handle;
 	u64 return_start;
 	u64 owner_observed;
 } pvm_cpu_completed;
@@ -717,6 +719,7 @@ static bool pvm_cpu_lease_return(struct pkvm_hyp_vcpu *hyp_vcpu)
 		goto invalid_locked;
 	pvm_cpu_completed.owner_vcpu = pvm_cpu_lease.owner_vcpu;
 	pvm_cpu_completed.token = token;
+	pvm_cpu_completed.receiver_handle = pvm_cpu_lease.receiver->kvm.arch.pkvm.handle;
 	pvm_cpu_completed.forward_ticks = pvm_cpu_lease.import_ticks - pvm_cpu_lease.export_ticks;
 	pvm_cpu_completed.return_start = started;
 	pvm_cpu_completed.owner_observed = 0;
@@ -820,13 +823,77 @@ static bool pvm_cpu_lease_event_poll(struct pkvm_hyp_vcpu *hyp_vcpu)
 	pvm_cpu_lease.event_pending = false;
 	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, pvm_cpu_lease.token,
 			 pvm_cpu_lease.size, 0);
-	__kvm_inject_el1_irq_live(vcpu);
 	hyp_spin_unlock(&pvm_dma_share_lock);
 	return true;
 
 invalid_locked:
 	smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
 	hyp_spin_unlock(&pvm_dma_share_lock);
+	return true;
+}
+
+/* Optional deterministic access-revocation test handshake, no buffer contents. */
+static bool pvm_cpu_lease_sync(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u64 token = smccc_get_arg2(vcpu), ack = smccc_get_arg3(vcpu);
+
+	if (ack > 1 || smccc_get_arg4(vcpu) || smccc_get_arg5(vcpu) || smccc_get_arg6(vcpu))
+		goto invalid;
+	hyp_spin_lock(&pvm_dma_share_lock);
+	if (!pvm_cpu_lease.owner || pvm_cpu_lease.token != token ||
+	    (pvm_cpu_lease.owner_vcpu != hyp_vcpu &&
+	     pvm_cpu_lease.receiver != pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu)) ||
+	    (ack && (pvm_cpu_lease.owner_vcpu != hyp_vcpu || !pvm_cpu_lease.mapped))) {
+		hyp_spin_unlock(&pvm_dma_share_lock);
+		goto invalid;
+	}
+	if (ack)
+		pvm_cpu_lease.acknowledged = true;
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, pvm_cpu_lease.mapped,
+			 pvm_cpu_lease.acknowledged, 0);
+	hyp_spin_unlock(&pvm_dma_share_lock);
+	return true;
+invalid:
+	smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+	return true;
+}
+
+static bool pvm_cpu_lease_notify(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	struct kvm_hyp_req *req;
+	u64 token = smccc_get_arg2(vcpu), returning = smccc_get_arg3(vcpu);
+	u64 target;
+
+	if (!token || returning > 1 || smccc_get_arg4(vcpu) ||
+	    smccc_get_arg5(vcpu) || smccc_get_arg6(vcpu))
+		goto invalid;
+	hyp_spin_lock(&pvm_dma_share_lock);
+	if (!returning && pvm_cpu_lease.token == token &&
+	    pvm_cpu_lease.owner_vcpu == hyp_vcpu) {
+		target = pvm_cpu_lease.receiver->kvm.arch.pkvm.handle;
+	} else if (returning && pvm_cpu_completed.token == token &&
+		   pvm_cpu_completed.owner_vcpu &&
+		   pvm_cpu_completed.receiver_handle == vcpu->kvm->arch.pkvm.handle) {
+		target = pvm_cpu_completed.owner_vcpu->vcpu.kvm->arch.pkvm.handle;
+	} else {
+		hyp_spin_unlock(&pvm_dma_share_lock);
+		goto invalid;
+	}
+	req = pkvm_hyp_req_reserve(hyp_vcpu, KVM_HYP_REQ_TYPE_PVM_NOTIFY);
+	if (!req) {
+		hyp_spin_unlock(&pvm_dma_share_lock);
+		goto invalid;
+	}
+	req->pvm_notify.handle = target;
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, 0, 0, 0);
+	hyp_spin_unlock(&pvm_dma_share_lock);
+	/* State is already published. Do not rewind/replay the guest HVC. */
+	*exit_code = ARM_EXCEPTION_HYP_REQ;
+	return false;
+invalid:
+	smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
 	return true;
 }
 
@@ -855,6 +922,10 @@ bool pkvm_pvm_dma_share_hvc(struct pkvm_hyp_vcpu *hyp_vcpu,
 		return pvm_dma_share_accept(hyp_vcpu, exit_code);
 	case KVM_PVM_DMA_SHARE_QUERY:
 		return pvm_dma_share_query(hyp_vcpu);
+	case KVM_PVM_BUFFER_LEASE_SYNC:
+		return pvm_cpu_lease_sync(hyp_vcpu);
+	case KVM_PVM_BUFFER_NOTIFY:
+		return pvm_cpu_lease_notify(hyp_vcpu, exit_code);
 	case KVM_PVM_BUFFER_TIMING:
 		return pvm_cpu_lease_timing(hyp_vcpu);
 	case KVM_PVM_DMA_SHARE_EXPORT:

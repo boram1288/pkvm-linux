@@ -209,6 +209,30 @@ void __kvm_inject_el1_irq_live(struct kvm_vcpu *vcpu)
 	__vcpu_assign_sys_reg(vcpu, SPSR_EL1, old);
 }
 
+/* Inject a synchronous abort before an nVHE fast-path guest re-entry. */
+void __kvm_inject_el1_sync_live(struct kvm_vcpu *vcpu)
+{
+	u64 old = read_sysreg_el2(SYS_SPSR);
+	u64 return_pc = read_sysreg_el2(SYS_ELR);
+	u64 vbar = __vcpu_read_sys_reg(vcpu, VBAR_EL1);
+	u64 sctlr = __vcpu_read_sys_reg(vcpu, SCTLR_EL1);
+	u64 offset, new;
+
+	offset = get_except64_offset(old, PSR_MODE_EL1h, except_type_sync);
+	new = get_except64_cpsr(old, kvm_has_mte(kern_hyp_va(vcpu->kvm)),
+				sctlr, PSR_MODE_EL1h);
+
+	write_sysreg_el1(return_pc, SYS_ELR);
+	write_sysreg_el1(old, SYS_SPSR);
+	write_sysreg_el2(vbar + offset, SYS_ELR);
+	write_sysreg_el2(new, SYS_SPSR);
+
+	*vcpu_pc(vcpu) = vbar + offset;
+	*vcpu_cpsr(vcpu) = new;
+	__vcpu_assign_sys_reg(vcpu, ELR_EL1, return_pc);
+	__vcpu_assign_sys_reg(vcpu, SPSR_EL1, old);
+}
+
 /*
  * When an exception is taken, most CPSR fields are left unchanged in the
  * handler. However, some are explicitly overridden (e.g. M[4:0]).

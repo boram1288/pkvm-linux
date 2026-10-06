@@ -24,6 +24,7 @@
 #include <asm/traps.h>
 
 #include <kvm/arm_hypercalls.h>
+#include <kvm/arm_vgic.h>
 
 #define CREATE_TRACE_POINTS
 #include "trace_handle_exit.h"
@@ -484,6 +485,29 @@ static int handle_hyp_req_mem(struct kvm_vcpu *vcpu, struct kvm_hyp_req *req)
 	return -EINVAL;
 }
 
+/* The IRQ is only a wakeup hint. EL2 authenticates the buffer/token separately. */
+static int handle_pvm_notify(struct kvm_hyp_req *req)
+{
+	struct kvm *candidate, *target = NULL;
+	int ret = 0;
+
+	mutex_lock(&kvm_lock);
+	list_for_each_entry(candidate, &vm_list, vm_list) {
+		if (candidate->arch.pkvm.handle == req->pvm_notify.handle &&
+		    kvm_vm_is_protected(candidate) && kvm_get_kvm_safe(candidate)) {
+			target = candidate;
+			break;
+		}
+	}
+	mutex_unlock(&kvm_lock);
+	/* A target that has already exited needs no wakeup. */
+	if (!target)
+		return 0;
+	ret = kvm_vgic_inject_irq(target, NULL, 127, true, NULL);
+	kvm_put_kvm(target);
+	return ret;
+}
+
 int handle_hyp_req(struct kvm_vcpu *vcpu, struct kvm_hyp_req *req, void *arg)
 {
 	trace_kvm_handle_hyp_req(vcpu, req);
@@ -511,6 +535,11 @@ int handle_hyp_req(struct kvm_vcpu *vcpu, struct kvm_hyp_req *req, void *arg)
 
 	case KVM_HYP_REQ_TYPE_MEM_HOST_S2:
 		return pkvm_host_stage2_topup();
+
+	case KVM_HYP_REQ_TYPE_PVM_NOTIFY:
+		if (!vcpu || !kvm_vm_is_protected(vcpu->kvm))
+			return -EINVAL;
+		return handle_pvm_notify(req);
 
 	case KVM_HYP_LAST_REQ:
 		return 0;

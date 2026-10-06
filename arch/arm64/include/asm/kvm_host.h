@@ -864,6 +864,7 @@ enum {
 	KVM_HYP_REQ_TYPE_HYP_ALLOC,
 	KVM_HYP_REQ_TYPE_MEM_IOMMU,
 	KVM_HYP_REQ_TYPE_MEM_HOST_S2,
+	KVM_HYP_REQ_TYPE_PVM_NOTIFY,
 	__KVM_HYP_REQ_TYPE_MAX
 };
 
@@ -892,6 +893,9 @@ struct kvm_hyp_req {
 			size_t		size;
 		} split;
 		struct {
+			unsigned long handle;
+		} pvm_notify;
+		struct {
 			/* Helper for SMCCC encoding/decoding */
 			u8	args[KVM_HYP_REQ_SMCCC_ARG_SIZE_MAX];
 		} args;
@@ -916,6 +920,8 @@ static inline size_t kvm_hyp_req_arg_size(u8 type)
 	case KVM_HYP_REQ_TYPE_HYP_ALLOC:
 	case KVM_HYP_REQ_TYPE_MEM_IOMMU:
 		return sizeof(req->mem);
+	case KVM_HYP_REQ_TYPE_PVM_NOTIFY:
+		return sizeof(req->pvm_notify);
 	case KVM_HYP_REQ_TYPE_MEM_HOST_S2:
 		return 0;
 	default:

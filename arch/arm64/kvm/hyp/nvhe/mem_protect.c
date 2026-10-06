@@ -1792,9 +1792,6 @@ bool __pkvm_inject_pvm_lease_abort(struct pkvm_hyp_vcpu *hyp_vcpu)
 	s8 level;
 	int ret;
 
-	if (!kvm_vcpu_dabt_isvalid(vcpu))
-		return false;
-
 	ipa = kvm_vcpu_get_fault_ipa(vcpu);
 	ipa |= kvm_vcpu_get_hfar(vcpu) & FAR_MASK;
 	guest_lock_component(vm);
@@ -1804,14 +1801,18 @@ bool __pkvm_inject_pvm_lease_abort(struct pkvm_hyp_vcpu *hyp_vcpu)
 	    pte != KVM_PVM_LEASE_PROT_NOTE)
 		return false;
 
-	esr = ESR_ELx_IL | ESR_ELx_FSC_EXTABT;
+	esr = ESR_ELx_IL | ESR_ELx_FSC_EXTABT |
+		(kvm_vcpu_get_esr(vcpu) & ESR_ELx_WNR);
 	if ((cpsr & PSR_MODE_MASK) == PSR_MODE_EL0t)
 		esr |= ESR_ELx_EC_DABT_LOW << ESR_ELx_EC_SHIFT;
 	else
 		esr |= ESR_ELx_EC_DABT_CUR << ESR_ELx_EC_SHIFT;
 	__vcpu_assign_sys_reg(vcpu, ESR_EL1, esr);
 	__vcpu_assign_sys_reg(vcpu, FAR_EL1, kvm_vcpu_get_hfar(vcpu));
-	kvm_pend_exception(vcpu, EXCEPT_AA64_EL1_SYNC);
+	/* Saved sysregs alone are not restored on the EL2 fast re-entry. */
+	write_sysreg_el1(esr, SYS_ESR);
+	write_sysreg_el1(kvm_vcpu_get_hfar(vcpu), SYS_FAR);
+	__kvm_inject_el1_sync_live(vcpu);
 
 	return true;
 }
