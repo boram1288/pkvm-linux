@@ -10,6 +10,7 @@
 #include <linux/arm-smccc.h>
 #include <linux/iommu.h>
 #include <linux/mm.h>
+#include <linux/sizes.h>
 
 #include <asm/stage2_pgtable.h>
 
@@ -42,11 +43,18 @@ static struct pvm_dma_share pvm_dma_share;
  * grant above, this lease moves a guest stage-2 mapping and never maps the
  * backing page into Host stage-2.
  */
+#define PVM_CPU_LEASE_MAX_SIZE SZ_8M
+#define PVM_CPU_LEASE_MAX_PAGES (PVM_CPU_LEASE_MAX_SIZE / PAGE_SIZE)
+
 struct pvm_cpu_lease {
 	struct pkvm_hyp_vcpu *owner_vcpu;
 	struct pkvm_hyp_vm *owner;
 	struct pkvm_hyp_vm *receiver;
-	phys_addr_t pa;
+	phys_addr_t pages[PVM_CPU_LEASE_MAX_PAGES];
+	u64 size;
+	u32 mapped_pages;
+	u64 export_ticks;
+	u64 import_ticks;
 	u64 owner_ipa;
 	u64 receiver_ipa;
 	u64 token;
@@ -57,6 +65,22 @@ struct pvm_cpu_lease {
 
 static struct pvm_cpu_lease pvm_cpu_lease;
 static u64 pvm_cpu_next_token = 0x504b564d00000000ULL;
+
+/* All transfer timestamps use the same EL2 physical counter. */
+static struct {
+	struct pkvm_hyp_vcpu *owner_vcpu;
+	u64 token;
+	u64 forward_ticks;
+	u64 return_start;
+	u64 owner_observed;
+} pvm_cpu_completed;
+
+static u64 pvm_cpu_clock(void)
+{
+	isb();
+	return read_sysreg(cntpct_el0);
+}
+
 
 #define PVM_MSG_MAX_ENDPOINT 2
 #define PVM_MSG_MAX_SIZE 256
@@ -336,24 +360,35 @@ static void __pvm_dma_share_revoke(void)
 	memset(&pvm_dma_share, 0, sizeof(pvm_dma_share));
 }
 
-static void __pvm_cpu_lease_revoke(struct pkvm_hyp_vm *teardown_vm)
+/* Restore every mapped page before invalidating the transfer. */
+static int pvm_cpu_lease_restore(void)
 {
 	int ret;
+	u32 i;
 
+	while (pvm_cpu_lease.mapped_pages) {
+		i = pvm_cpu_lease.mapped_pages - 1;
+		ret = __pkvm_guest_return_page(pvm_cpu_lease.owner_vcpu,
+			pvm_cpu_lease.owner_ipa + i * PAGE_SIZE,
+			pvm_cpu_lease.receiver,
+			pvm_cpu_lease.receiver_ipa + i * PAGE_SIZE,
+			pvm_cpu_lease.pages[i]);
+		if (ret)
+			return ret;
+		pvm_cpu_lease.mapped_pages--;
+	}
+	pvm_cpu_lease.mapped = false;
+	return 0;
+}
+
+static void __pvm_cpu_lease_revoke(struct pkvm_hyp_vm *teardown_vm)
+{
 	if (!pvm_cpu_lease.owner ||
 	    (pvm_cpu_lease.owner != teardown_vm &&
 	     pvm_cpu_lease.receiver != teardown_vm))
 		return;
-
-	if (pvm_cpu_lease.mapped) {
-		/* Restore owner stage-2 so normal owner teardown can reclaim it. */
-		ret = __pkvm_guest_return_page(pvm_cpu_lease.owner_vcpu,
-						pvm_cpu_lease.owner_ipa,
-						pvm_cpu_lease.receiver,
-						pvm_cpu_lease.receiver_ipa,
-						pvm_cpu_lease.pa);
-		WARN_ON(ret);
-	}
+	if (WARN_ON(pvm_cpu_lease_restore()))
+		return;
 	memset(&pvm_cpu_lease, 0, sizeof(pvm_cpu_lease));
 }
 
@@ -505,8 +540,10 @@ static bool pvm_cpu_lease_export(struct pkvm_hyp_vcpu *hyp_vcpu,
 	s8 level;
 	struct pkvm_hyp_vm *receiver;
 	int ret;
+	u64 offset;
 
-	if (!PAGE_ALIGNED(owner_ipa) || size != PAGE_SIZE ||
+	if (!PAGE_ALIGNED(owner_ipa) || !size || size > PVM_CPU_LEASE_MAX_SIZE ||
+	    owner_ipa + PAGE_ALIGN(size) < owner_ipa ||
 	    !receiver_endpoint ||
 	    receiver_endpoint == hyp_vcpu_to_endpoint_id(hyp_vcpu) ||
 	    smccc_get_arg5(vcpu) || smccc_get_arg6(vcpu))
@@ -519,38 +556,40 @@ static bool pvm_cpu_lease_export(struct pkvm_hyp_vcpu *hyp_vcpu,
 	}
 	hyp_spin_unlock(&pvm_dma_share_lock);
 
-	ret = pkvm_get_guest_pa_request(hyp_vcpu, owner_ipa, PAGE_SIZE, &pa, &level);
-	if (ret == -ENOENT) {
-		*exit_code = ARM_EXCEPTION_HYP_REQ;
-		return false;
-	}
-	if (ret)
-		goto invalid;
-	if (kvm_granule_size(level) != PAGE_SIZE) {
-		int cache_ready;
-
-		/*
-		 * Ordinary guest RAM is usually populated as PMD-level
-		 * stage-2 blocks. Split the covering block into page-level
-		 * entries so a single 4 KiB page can move to the receiver
-		 * without disturbing the rest of the block.
-		 */
-		if (kvm_granule_size(level) != PMD_SIZE)
-			goto invalid;
-		cache_ready = pvm_cpu_lease_memcache_ready(hyp_vcpu, exit_code);
-		if (cache_ready < 0)
-			goto invalid;
-		if (!cache_ready)
+	for (offset = 0; offset < PAGE_ALIGN(size); offset += PAGE_SIZE) {
+		ret = pkvm_get_guest_pa_request(hyp_vcpu, owner_ipa + offset, PAGE_SIZE, &pa, &level);
+		if (ret == -ENOENT) {
+			*exit_code = ARM_EXCEPTION_HYP_REQ;
 			return false;
-		ret = __pkvm_host_split_guest(
-			ALIGN_DOWN(owner_ipa, PMD_SIZE) >> PAGE_SHIFT,
-			PMD_SIZE, hyp_vcpu);
+		}
 		if (ret)
 			goto invalid;
-		ret = pkvm_get_guest_pa_request(hyp_vcpu, owner_ipa, PAGE_SIZE,
-						&pa, &level);
-		if (ret || kvm_granule_size(level) != PAGE_SIZE)
-			goto invalid;
+		if (kvm_granule_size(level) != PAGE_SIZE) {
+			int cache_ready;
+
+			/*
+			 * Ordinary guest RAM is usually populated as PMD-level
+			 * stage-2 blocks. Split the covering block into page-level
+			 * entries so a single 4 KiB page can move to the receiver
+			 * without disturbing the rest of the block.
+			 */
+			if (kvm_granule_size(level) != PMD_SIZE)
+				goto invalid;
+			cache_ready = pvm_cpu_lease_memcache_ready(hyp_vcpu, exit_code);
+			if (cache_ready < 0)
+				goto invalid;
+			if (!cache_ready)
+				return false;
+			ret = __pkvm_host_split_guest(
+				ALIGN_DOWN(owner_ipa + offset, PMD_SIZE) >> PAGE_SHIFT,
+				PMD_SIZE, hyp_vcpu);
+			if (ret)
+				goto invalid;
+			ret = pkvm_get_guest_pa_request(hyp_vcpu, owner_ipa + offset, PAGE_SIZE,
+							&pa, &level);
+			if (ret || kvm_granule_size(level) != PAGE_SIZE)
+				goto invalid;
+		}
 	}
 
 	hyp_spin_lock(&pvm_dma_share_lock);
@@ -566,10 +605,11 @@ static bool pvm_cpu_lease_export(struct pkvm_hyp_vcpu *hyp_vcpu,
 	pvm_cpu_lease.owner_vcpu = hyp_vcpu;
 	pvm_cpu_lease.owner = vm;
 	pvm_cpu_lease.receiver = receiver;
-	pvm_cpu_lease.pa = pa;
+	pvm_cpu_lease.size = size;
 	pvm_cpu_lease.owner_ipa = owner_ipa;
 	pvm_cpu_lease.receiver_endpoint = receiver_endpoint;
 	pvm_cpu_lease.token = ++pvm_cpu_next_token;
+	pvm_cpu_lease.export_ticks = pvm_cpu_clock();
 	pvm_cpu_lease.event_pending = true;
 	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, pvm_cpu_lease.token, 0, 0);
 	hyp_spin_unlock(&pvm_dma_share_lock);
@@ -605,20 +645,39 @@ static bool pvm_cpu_lease_import(struct pkvm_hyp_vcpu *hyp_vcpu,
 		hyp_spin_unlock(&pvm_dma_share_lock);
 		goto invalid;
 	}
-	ret = __pkvm_guest_export_page(pvm_cpu_lease.owner_vcpu,
-					pvm_cpu_lease.owner_ipa, vm, receiver_ipa,
-					&vcpu->arch.stage2_mc, &pa);
-	if (!ret && pa == pvm_cpu_lease.pa) {
-		pvm_cpu_lease.receiver_ipa = receiver_ipa;
-		pvm_cpu_lease.mapped = true;
-		smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, PAGE_SIZE, 0, 0);
+	if (receiver_ipa + PAGE_ALIGN(pvm_cpu_lease.size) < receiver_ipa ||
+	    (pvm_cpu_lease.mapped_pages &&
+	     pvm_cpu_lease.receiver_ipa != receiver_ipa)) {
 		hyp_spin_unlock(&pvm_dma_share_lock);
-		return true;
+		goto invalid;
 	}
-	if (!ret)
-		WARN_ON(__pkvm_guest_return_page(pvm_cpu_lease.owner_vcpu,
-						pvm_cpu_lease.owner_ipa, vm,
-						receiver_ipa, pa));
+	pvm_cpu_lease.receiver_ipa = receiver_ipa;
+	while (pvm_cpu_lease.mapped_pages < DIV_ROUND_UP(pvm_cpu_lease.size, PAGE_SIZE)) {
+		u32 i = pvm_cpu_lease.mapped_pages;
+
+		cache_ready = pvm_cpu_lease_memcache_ready(hyp_vcpu, exit_code);
+		if (!cache_ready) {
+			hyp_spin_unlock(&pvm_dma_share_lock);
+			return false;
+		}
+		if (cache_ready < 0)
+			goto rollback;
+		ret = __pkvm_guest_export_page(pvm_cpu_lease.owner_vcpu,
+			pvm_cpu_lease.owner_ipa + i * PAGE_SIZE, vm,
+			receiver_ipa + i * PAGE_SIZE, &vcpu->arch.stage2_mc, &pa);
+		if (ret)
+			goto rollback;
+		pvm_cpu_lease.pages[i] = pa;
+		pvm_cpu_lease.mapped_pages++;
+	}
+	pvm_cpu_lease.mapped = true;
+	pvm_cpu_lease.import_ticks = pvm_cpu_clock();
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, pvm_cpu_lease.size, 0, 0);
+	hyp_spin_unlock(&pvm_dma_share_lock);
+	return true;
+
+rollback:
+	WARN_ON(pvm_cpu_lease_restore());
 	hyp_spin_unlock(&pvm_dma_share_lock);
 
 invalid:
@@ -631,17 +690,21 @@ static bool pvm_cpu_lease_return(struct pkvm_hyp_vcpu *hyp_vcpu)
 	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
 	u64 token = smccc_get_arg2(vcpu);
 	int ret;
+	u64 started = pvm_cpu_clock();
 
 	hyp_spin_lock(&pvm_dma_share_lock);
 	if (!pvm_cpu_lease.mapped || pvm_cpu_lease.token != token ||
 	    pvm_cpu_lease.receiver != pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu) ||
 	    pvm_cpu_lease.receiver_endpoint != hyp_vcpu_to_endpoint_id(hyp_vcpu))
 		goto invalid_locked;
-	ret = __pkvm_guest_return_page(pvm_cpu_lease.owner_vcpu,
-					pvm_cpu_lease.owner_ipa, pvm_cpu_lease.receiver,
-					pvm_cpu_lease.receiver_ipa, pvm_cpu_lease.pa);
+	ret = pvm_cpu_lease_restore();
 	if (ret)
 		goto invalid_locked;
+	pvm_cpu_completed.owner_vcpu = pvm_cpu_lease.owner_vcpu;
+	pvm_cpu_completed.token = token;
+	pvm_cpu_completed.forward_ticks = pvm_cpu_lease.import_ticks - pvm_cpu_lease.export_ticks;
+	pvm_cpu_completed.return_start = started;
+	pvm_cpu_completed.owner_observed = 0;
 	memset(&pvm_cpu_lease, 0, sizeof(pvm_cpu_lease));
 	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, 0, 0, 0);
 	hyp_spin_unlock(&pvm_dma_share_lock);
@@ -665,12 +728,7 @@ static bool pvm_cpu_lease_revoke(struct pkvm_hyp_vcpu *hyp_vcpu)
 	    pvm_cpu_lease.owner != pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu) ||
 	    pvm_cpu_lease.owner_vcpu != hyp_vcpu)
 		goto invalid_locked;
-	if (pvm_cpu_lease.mapped)
-		ret = __pkvm_guest_return_page(pvm_cpu_lease.owner_vcpu,
-					pvm_cpu_lease.owner_ipa,
-					pvm_cpu_lease.receiver,
-					pvm_cpu_lease.receiver_ipa,
-					pvm_cpu_lease.pa);
+	ret = pvm_cpu_lease_restore();
 	if (ret)
 		goto invalid_locked;
 	memset(&pvm_cpu_lease, 0, sizeof(pvm_cpu_lease));
@@ -695,6 +753,9 @@ static bool pvm_cpu_lease_query(struct pkvm_hyp_vcpu *hyp_vcpu)
 		((pvm_cpu_lease.owner_vcpu == hyp_vcpu) ||
 		 (pvm_cpu_lease.receiver == pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu)));
 	mapped = pvm_cpu_lease.mapped;
+	if (!active && pvm_cpu_completed.token == token &&
+	    pvm_cpu_completed.owner_vcpu == hyp_vcpu && !pvm_cpu_completed.owner_observed)
+		pvm_cpu_completed.owner_observed = pvm_cpu_clock();
 	hyp_spin_unlock(&pvm_dma_share_lock);
 	if (!active)
 		goto invalid;
@@ -703,6 +764,30 @@ static bool pvm_cpu_lease_query(struct pkvm_hyp_vcpu *hyp_vcpu)
 
 invalid:
 	smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+	return true;
+}
+
+static bool pvm_cpu_lease_timing(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u64 token = smccc_get_arg2(vcpu), forward, reverse = 0;
+
+	hyp_spin_lock(&pvm_dma_share_lock);
+	if (pvm_cpu_lease.token == token && pvm_cpu_lease.mapped &&
+	    (pvm_cpu_lease.owner_vcpu == hyp_vcpu ||
+	     pvm_cpu_lease.receiver == pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu))) {
+		forward = pvm_cpu_lease.import_ticks - pvm_cpu_lease.export_ticks;
+	} else if (pvm_cpu_completed.token == token &&
+		   pvm_cpu_completed.owner_vcpu == hyp_vcpu && pvm_cpu_completed.owner_observed) {
+		forward = pvm_cpu_completed.forward_ticks;
+		reverse = pvm_cpu_completed.owner_observed - pvm_cpu_completed.return_start;
+	} else {
+		smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+		hyp_spin_unlock(&pvm_dma_share_lock);
+		return true;
+	}
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, forward, reverse, read_sysreg(cntfrq_el0));
+	hyp_spin_unlock(&pvm_dma_share_lock);
 	return true;
 }
 
@@ -719,7 +804,7 @@ static bool pvm_cpu_lease_event_poll(struct pkvm_hyp_vcpu *hyp_vcpu)
 
 	pvm_cpu_lease.event_pending = false;
 	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, pvm_cpu_lease.token,
-			 PAGE_SIZE, 0);
+			 pvm_cpu_lease.size, 0);
 	__kvm_inject_el1_irq_live(vcpu);
 	hyp_spin_unlock(&pvm_dma_share_lock);
 	return true;
@@ -755,6 +840,8 @@ bool pkvm_pvm_dma_share_hvc(struct pkvm_hyp_vcpu *hyp_vcpu,
 		return pvm_dma_share_accept(hyp_vcpu, exit_code);
 	case KVM_PVM_DMA_SHARE_QUERY:
 		return pvm_dma_share_query(hyp_vcpu);
+	case KVM_PVM_BUFFER_TIMING:
+		return pvm_cpu_lease_timing(hyp_vcpu);
 	case KVM_PVM_DMA_SHARE_EXPORT:
 		return pvm_cpu_lease_export(hyp_vcpu, exit_code);
 	case KVM_PVM_DMA_SHARE_IMPORT:
@@ -793,6 +880,9 @@ void pkvm_pvm_dma_share_teardown(struct pkvm_hyp_vm *vm)
 {
 	hyp_spin_lock(&pvm_dma_share_lock);
 	__pvm_cpu_lease_revoke(vm);
+	if (pvm_cpu_completed.owner_vcpu &&
+	    pkvm_hyp_vcpu_to_hyp_vm(pvm_cpu_completed.owner_vcpu) == vm)
+		memset(&pvm_cpu_completed, 0, sizeof(pvm_cpu_completed));
 	if (pvm_dma_share.owner == vm || pvm_dma_share.receiver == vm)
 		__pvm_dma_share_revoke();
 	memset(pvm_msg_queues, 0, sizeof(pvm_msg_queues));
