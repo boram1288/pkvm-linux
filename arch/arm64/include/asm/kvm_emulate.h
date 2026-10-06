@@ -76,6 +76,7 @@ unsigned long get_except64_offset(unsigned long psr, unsigned long target_mode,
 unsigned long get_except64_cpsr(unsigned long old, bool has_mte,
 				unsigned long sctlr, unsigned long mode);
 void __kvm_inject_el1_irq_live(struct kvm_vcpu *vcpu);
+void __kvm_inject_el1_sync_live(struct kvm_vcpu *vcpu);
 
 void kvm_vcpu_wfi(struct kvm_vcpu *vcpu);
 

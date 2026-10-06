@@ -19,6 +19,8 @@
 #define KVM_PVM_MSG_RECV_POP		15
 #define KVM_PVM_MSG_QUEUE_DEPTH		16
 #define KVM_PVM_BUFFER_TIMING		17
+#define KVM_PVM_BUFFER_NOTIFY		18
+#define KVM_PVM_BUFFER_LEASE_SYNC	19
 
 bool pkvm_pvm_dma_share_hvc(struct pkvm_hyp_vcpu *hyp_vcpu,
 			    u64 *exit_code);
