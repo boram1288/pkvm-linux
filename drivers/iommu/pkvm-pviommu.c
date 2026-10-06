@@ -140,8 +140,12 @@ static int pviommu_map_pages(struct iommu_domain *domain, unsigned long iova,
 				  paddr, requested_size - *mapped, __linux_prot_smccc(prot), &res);
 		cur_mapped = res.a1;
 		*mapped += cur_mapped;
-		if (res.a0 != SMCCC_RET_SUCCESS)
+		if (res.a0 != SMCCC_RET_SUCCESS) {
+			pr_err("pviommu: map failed domain=%lu iova=%lx ipa=%llx size=%zu ret=%ld mapped=%zu\n",
+			       pv_domain->id, iova, paddr, requested_size - *mapped,
+			       res.a0, cur_mapped);
 			break;
+		}
 		iova += cur_mapped;
 		paddr += cur_mapped;
 	}
@@ -210,7 +214,7 @@ static void pviommu_remove_dev_pasid(struct device *dev, ioasid_t pasid,
 	u32 sid;
 	int i;
 
-	if (!fwspec || !pv_domain)
+	if (!fwspec || !domain || domain->type == IOMMU_DOMAIN_BLOCKED)
 		return;
 
 	for (i = 0; i < fwspec->num_ids; i++) {
@@ -242,11 +246,18 @@ static int pviommu_set_dev_pasid(struct iommu_domain *domain,
 	if (!fwspec)
 		return -ENOENT;
 
-	if (old)
+	if (old && old->type != IOMMU_DOMAIN_BLOCKED)
 		pviommu_remove_dev_pasid(dev, pasid, old);
 
 	for (i = 0; i < fwspec->num_ids; i++) {
 		sid = fwspec->ids[i];
+		/* Authenticate and acquire the endpoint before attaching DMA. */
+		arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_DEV_REQ_DMA_FUNC_ID,
+				  pv->id, sid, 0, 0, 0, 0, &res);
+		if (res.a0) {
+			ret = smccc_to_linux_ret(res.a0);
+			break;
+		}
 		arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID,
 				  KVM_PVIOMMU_OP_ATTACH_DEV,
 				  pv->id, sid, pasid,
@@ -259,6 +270,7 @@ static int pviommu_set_dev_pasid(struct iommu_domain *domain,
 
 	if (ret) {
 		while (i--) {
+			sid = fwspec->ids[i];
 			arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID,
 					  KVM_PVIOMMU_OP_DETACH_DEV,
 					  pv->id, sid, pasid,
@@ -296,6 +308,11 @@ static struct iommu_domain *pviommu_domain_alloc_paging(struct device *dev)
 
 	pv_domain->id = res.a1;
 	pv_domain->domain.pgsize_bitmap = pgsize_bitmap;
+	/* The current HVC ABI does not report IOVA width. Use a conservative
+	 * 32-bit aperture instead of allocating invalid 64-bit IOVAs. */
+	pv_domain->domain.geometry.aperture_start = 0;
+	pv_domain->domain.geometry.aperture_end = DMA_BIT_MASK(32);
+	pv_domain->domain.geometry.force_aperture = true;
 	return &pv_domain->domain;
 }
 
@@ -386,7 +403,39 @@ static struct iommu_group *pviommu_device_group(struct device *dev)
 	}
 }
 
+static int pviommu_attach_blocked(struct iommu_domain *domain, struct device *dev)
+{
+	struct iommu_domain *old = iommu_get_domain_for_dev(dev);
+	struct pviommu_master *master = dev_iommu_priv_get(dev);
+	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+	struct pviommu_domain *pv_domain;
+	struct arm_smccc_res res;
+	int i;
+
+	if (!old || old->type == IOMMU_DOMAIN_BLOCKED)
+		return 0;
+	if (!master || !fwspec)
+		return -ENODEV;
+	pv_domain = container_of(old, struct pviommu_domain, domain);
+	for (i = 0; i < fwspec->num_ids; i++) {
+		arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID,
+			KVM_PVIOMMU_OP_DETACH_DEV, master->iommu->id,
+			fwspec->ids[i], 0, pv_domain->id, 0, &res);
+		if (res.a0)
+			return smccc_to_linux_ret(res.a0);
+	}
+	return 0;
+}
+
+static struct iommu_domain pviommu_blocked_domain = {
+	.type = IOMMU_DOMAIN_BLOCKED,
+	.ops = &(const struct iommu_domain_ops) {
+		.attach_dev = pviommu_attach_blocked,
+	},
+};
+
 static struct iommu_ops pviommu_ops = {
+	.blocked_domain = &pviommu_blocked_domain,
 	.device_group		= pviommu_device_group,
 	.of_xlate		= pviommu_of_xlate,
 	.probe_device		= pviommu_probe_device,

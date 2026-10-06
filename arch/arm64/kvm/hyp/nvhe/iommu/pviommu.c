@@ -16,6 +16,7 @@
 
 struct pviommu_guest_domain {
 	pkvm_handle_t		id;
+	bool			allocated;
 	struct list_head	list;
 };
 
@@ -91,6 +92,31 @@ static void pkvm_pviommu_hyp_req(u64 *exit_code)
 	*exit_code = ARM_EXCEPTION_HYP_REQ;
 }
 
+/* Retain a guest domain across endpoint detach/re-attach. */
+static int pkvm_guest_iommu_ensure_domain(struct pkvm_hyp_vm *vm,
+				       u64 iommu_id, u64 domain_id)
+{
+	struct pviommu_guest_domain *domain;
+	int ret = -EINVAL;
+
+	hyp_spin_lock(&pviommu_guest_domain_lock);
+	list_for_each_entry(domain, &vm->domains, list) {
+		if (domain->id != domain_id)
+			continue;
+		if (domain->allocated) {
+			ret = 0;
+			break;
+		}
+		ret = kvm_iommu_alloc_domain(pviommu_drv_id, iommu_id,
+					     domain_id, KVM_IOMMU_DOMAIN_ANY_TYPE);
+		if (!ret)
+			domain->allocated = true;
+		break;
+	}
+	hyp_spin_unlock(&pviommu_guest_domain_lock);
+	return ret;
+}
+
 static bool pkvm_guest_iommu_attach_dev(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code)
 {
 	int ret;
@@ -109,7 +135,7 @@ static bool pkvm_guest_iommu_attach_dev(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exi
 	iommu_id = route.iommu;
 	sid = route.sid;
 
-	ret = kvm_iommu_alloc_domain(pviommu_drv_id, iommu_id, domain_id, KVM_IOMMU_DOMAIN_ANY_TYPE);
+	ret = pkvm_guest_iommu_ensure_domain(vm, iommu_id, domain_id);
 	if (ret == -ENOMEM) {
 		pkvm_pviommu_hyp_req(exit_code);
 		return false;
@@ -119,7 +145,7 @@ static bool pkvm_guest_iommu_attach_dev(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exi
 
 	ret = kvm_iommu_attach_dev(iommu_id, domain_id, sid, pasid, pasid_bits, 0);
 	if (ret == -ENOMEM) {
-		WARN_ON(kvm_iommu_free_domain(domain_id));
+		/* Retain the allocated domain while retrying attachment. */
 		/*
 		 * The driver will request memory when returning -ENOMEM, so go back to host to
 		 * fulfill the request and repeat the HVC.
@@ -200,6 +226,7 @@ static bool pkvm_guest_iommu_alloc_domain(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *e
 	 */
 
 	guest_domain->id = domain_id;
+	guest_domain->allocated = false;
 	list_add_tail(&guest_domain->list, &vm->domains);
 	hyp_spin_unlock(&pviommu_guest_domain_lock);
 	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, domain_id, 0, 0);
@@ -227,11 +254,12 @@ static bool pkvm_guest_iommu_free_domain(struct pkvm_hyp_vcpu *hyp_vcpu)
 	}
 
 	hyp_spin_lock(&pviommu_guest_domain_lock);
-	ret = kvm_iommu_free_domain(domain_id);
-	if (ret)
-		goto out_unlock;
+	ret = -EINVAL;
 	list_for_each_entry_safe(guest_domain, temp, &vm->domains, list) {
 		if (guest_domain->id == domain_id) {
+			ret = guest_domain->allocated ? kvm_iommu_free_domain(domain_id) : 0;
+			if (ret)
+				goto out_unlock;
 			pkvm_guest_iommu_free_id(domain_id);
 			list_del(&guest_domain->list);
 			hyp_free(guest_domain);
@@ -381,7 +409,8 @@ void kvm_iommu_teardown_guest_domains(struct pkvm_hyp_vm *hyp_vm)
 
 	hyp_spin_lock(&pviommu_guest_domain_lock);
 	list_for_each_entry_safe(guest_domain, temp, &hyp_vm->domains, list) {
-		kvm_iommu_force_free_domain(guest_domain->id, hyp_vm);
+		if (guest_domain->allocated)
+			kvm_iommu_force_free_domain(guest_domain->id, hyp_vm);
 		pkvm_guest_iommu_free_id(guest_domain->id);
 		list_del(&guest_domain->list);
 		hyp_free(guest_domain);

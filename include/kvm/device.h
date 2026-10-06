@@ -40,6 +40,8 @@ struct pkvm_device {
 	unsigned short refcount;
 	bool power_locked;
 	bool hyp_owned;
+	bool quarantined;
+	u64 lease_epoch;
 	struct pkvm_device_ops *ops;
 	void *cookie; /* cookie from drivers. */
 };
