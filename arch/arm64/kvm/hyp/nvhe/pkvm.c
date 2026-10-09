@@ -580,6 +580,12 @@ static int init_pkvm_hyp_vm(struct kvm *host_kvm, struct pkvm_hyp_vm *hyp_vm,
 
 	if (hyp_vm->kvm.arch.pkvm.is_protected)
 		pvmfw_load_addr = READ_ONCE(host_kvm->arch.pkvm.pvmfw_load_addr);
+	/* A trusted boot reservation opts this machine into verified pVM boot.
+	 * The compromised Host must not bypass the verifier by omitting SET_FW_IPA.
+	 * Existing machines without a firmware reservation retain their ABI. */
+	if (hyp_vm->kvm.arch.pkvm.is_protected && pvmfw_size &&
+	    pvmfw_load_addr == PVMFW_INVALID_LOAD_ADDR)
+		return -EKEYREJECTED;
 	hyp_vm->kvm.arch.pkvm.pvmfw_load_addr = pvmfw_load_addr;
 
 	hyp_vm->kvm.arch.pkvm.smc_forwarded = READ_ONCE(host_kvm->arch.pkvm.smc_forwarded);
